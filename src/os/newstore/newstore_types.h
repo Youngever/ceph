@@ -40,6 +40,10 @@ struct fid_t {
   }
 };
 
+static inline operator<<(ostream& out, const fid_t& fid) {
+  return out << fid.fset << "/" << fid.fno;
+}
+
 /// fragment: a byte extent backed by a file
 struct fragment_t {
   uint32_t offset;   ///< offset in file to first byte of this fragment
@@ -48,6 +52,7 @@ struct fragment_t {
 
   fragment_t() : offset(0), length(0) {}
   fragment_t(uint32_t o, uint32_t l) : offset(o), length(l) {}
+  fragment_t(uint32_t o, uint32_t l, fid_t f) : offset(o), length(l), fid(f) {}
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& p);
@@ -55,6 +60,7 @@ struct fragment_t {
   static void generate_test_instances(list<fragment_t*>& o);
 };
 
+/// onode: per-object metadata
 struct onode_t {
   uint64_t size;                       ///< object size
   map<string, bufferlist> attrs;       ///< attrs
@@ -67,24 +73,6 @@ struct onode_t {
   void decode(bufferlist::iterator& p);
   void dump(Formatter *f);
   static void generate_test_instances(list<onode_t*>& o);
-};
-
-// -----------
-
-class Onode {
-  onode_t onode;
-
-};
-
-typedef ceph::shared_ptr<Onode> OnodeRef;
-
-
-
-
-struct CollectionCache {
-
-  SharedLRU<ghobject_t,OnodeRef> onode_map;
-
 };
 
 #endif

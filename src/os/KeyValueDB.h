@@ -86,6 +86,9 @@ public:
     const std::set<string> &key,      ///< [in] Key to retrieve
     std::map<string, bufferlist> *out ///< [out] Key value retrieved
     ) = 0;
+  virtual int get(const string &prefix, ///< [in] prefix
+		  const string &key,    ///< [in] key
+		  bufferlist *value);   ///< [out] value
 
   class WholeSpaceIteratorImpl {
   public:
