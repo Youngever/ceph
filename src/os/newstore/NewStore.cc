@@ -14,12 +14,9 @@
 
 #include "NewStore.h"
 
-NewStore::NewStore(CephContext *cct, const string& path,
-		   const string& journal_path)
+NewStore::NewStore(CephContext *cct, const string& path)
   : ObjectStore(path),
-    journal_path(journal_path),
     db(NULL),
-    journal(NULL),
     fsid_fd(-1),
     frag_fd(-1),
     mounted(false),
@@ -35,7 +32,6 @@ NewStore::NewStore(CephContext *cct, const string& path,
   _shutdown_logger();
   assert(!mounted);
   assert(db == NULL);
-  assert(journal == NULL);
   assert(fsid_fd < 0);
   assert(frag_fd < 0);
 }
@@ -52,11 +48,7 @@ void NewStore::_shutdown_logger()
 
 int NewStore::peek_journal_fsid(uuid_d *fsid)
 {
-  // make sure we don't try to use aio or direct_io (and get annoying
-  // error messages from failing to do so); performance implications
-  // should be irrelevant for this use
-  FileJournal j(*fsid, 0, 0, journal_path.c_str(), false, false);
-  return j.peek_fsid(*fsid);
+  return 0;
 }
 
 int NewStore::_open_path()
@@ -259,31 +251,9 @@ void NewStore::_close_db()
   db = NULL;
 }
 
-int NewStore::_create_journal()
-{
-
-}
-
-int NewStore::_open_journal()
-{
-  dout(10) << __func__ << " " << journal_path << dendl;
-  journal = new FileJournal(fsid, &finisher, &sync_cond,
-			    journal_path,
-			    g_conf->journal_dio,
-			    g_conf->journal_aio,
-			    g_conf->journal_force_aio);
-  journal->logger = logger;
-}
-
-void NewStore::_close_journal()
-{
-
-}
-
 int NewStore::mkfs()
 {
-  dout(1) << __func__ << " path " << path
-	  << " journal_path " << journal_path << dendl;
+  dout(1) << __func__ << " path " << path << dendl;
   int r;
   uuid_d old_fsid;
 
@@ -347,8 +317,7 @@ int NewStore::mount()
 {
   char db_dir[PATH_PATH];
 
-  dout(1) << __func__ << " path " << path
-	  << " journal_path " << journal_path << dendl;
+  dout(1) << __func__ << " path " << path << dendl;
 
   int r = _open_path();
   if (r < 0)
@@ -375,10 +344,6 @@ int NewStore::mount()
   if (r < 0)
     goto out_frag;
 
-  r = _open_journal();
-  if (r < 0)
-    goto out_db;
-
   finisher.start();
 
   mounted = true;
@@ -402,7 +367,6 @@ int NewStore::umount()
   if (fset_fd >= 0)
     VOID_TEMP_FAILURE_RETRY(::close(fset_fd));
   finisher.stop();
-  _close_journal();
   _close_db();
   _close_fsid();
   return 0;

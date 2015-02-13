@@ -129,9 +129,7 @@ class NewStore : public ObjectStore {
 
   // --------------------------------------------------------
   // members
-  string journal_path;
   KeyValueDB *db;
-  Journal *journal;
   uuid_d fsid;
   int path_fd;  ///< open handle to $path
   int fsid_fd;  ///< open handle (locked) to $path/fsid
@@ -167,21 +165,14 @@ class NewStore : public ObjectStore {
   int _open_db();
   void _close_db();
 
-  int _open_journal();
-  void _close_jouranl();
-
   CollectionRef _get_collection(coll_t cid);
 
   int _open_next_fid(fid_t *fid);
 
 
 public:
-  NewStore(CephContext *cct, const string& path, const string& journal_path);
-    : ObjectStore(path),
-      coll_lock("NewStore::coll_lock"),
-      Finisher(cct)
-  {}
-  ~NewStore() {}
+  NewStore(CephContext *cct, const string& path);
+  ~NewStore();
 
   bool need_journal() { return true; };
   int peek_journal_fsid(uuid_d *fsid);
