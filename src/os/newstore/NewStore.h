@@ -50,8 +50,9 @@ class NewStore : public ObjectStore {
   struct Onode {
     onode_t onode;
     bool dirty;  // ???
+    bool exists;
 
-    Onode() : dirty(false) {}
+    Onode() : dirty(false), exists(true) {}
   };
 
   struct Collection {
@@ -118,12 +119,24 @@ class NewStore : public ObjectStore {
   };
 
   struct TransContext {
-    list<int> fds;      ///< these fds need to be synced
+    list<int> fds;             ///< these fds need to be synced
+    list<OnodeRef> onodes;     ///< these onodes need to be updated/written
+    KeyValueDB::Transaction t; ///< then we will commit this
+    list<fid_t> remove;        ///< later, these fids need to be removed
 
     void sync_fd(int f) {
       fds.push_back(f);
     }
     int wait_sync();
+
+    void write_onode(OnodeRef &o) {
+      onodes.push_back(o);
+    }
+
+    void remove_fid(fid_t f) {
+      remove.push_back(f);
+    }
+
   };
   typedef ceph:shared_ptr<TransContextRef> TransContextRef;
 

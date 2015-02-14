@@ -63,7 +63,7 @@ struct fragment_t {
 /// onode: per-object metadata
 struct onode_t {
   uint64_t size;                       ///< object size
-  map<string, bufferlist> attrs;       ///< attrs
+  map<string, bufferptr> attrs;        ///< attrs
   map<uint64_t, fragment_t> data_map;  ///< data (offset to fragment mapping)
   uint64_t omap_head;                  ///< id for omap root node
 

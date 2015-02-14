@@ -12,6 +12,10 @@
  *
  */
 
+const string PREFIX_COLL = "C"; // collection name -> (nothing)
+const string PREFIX_OBJ = "O";  // object name -> onode
+const string PREFIX_WAL = "L";  // write ahead log
+
 #include "NewStore.h"
 
 NewStore::NewStore(CephContext *cct, const string& path)
@@ -425,7 +429,7 @@ bool NewStore::exists(coll_t cid, const ghobject_t& oid)
     return false;
   RWLock::RLocker l(c->lock);
   OnodeRef o = c->get(oid, false);
-  if (!o)
+  if (!o || !o->exists)
     return -ENOENT;
   return 0;
 }
@@ -442,7 +446,7 @@ int MemStore::stat(
     return -ENOENT;
   RWLock::RLocker l(c->lock);
   OnodeRef o = c->get_onode(oid, false);
-  if (!o)
+  if (!o || !o->exists)
     return -ENOENT;
   st->st_size = o->onode.size;
   st->st_blksize = 4096;
@@ -500,9 +504,25 @@ int NewStore::_open_next_fid(fid_t *fid)
   return r;
 }
 
+int NewStore::_finalize_onodes(TransContextRef& txc)
+{
+  dout(20) << __func__ << dendl;
+}
+
 
 // -----------------
 // write operations
+
+int NewStore::_touch(TransContextRef& txc,
+		     CollectionRef& c,
+		     const ghobject_t& oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r = 0;
+  OnodeRef o = c->get_onode(oid, true);
+  txc.add_onode(o);
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+}
 
 int NewStore::_write(TransContextRef& txc,
 		     CollectionRef& c,
@@ -541,6 +561,211 @@ int NewStore::_write(TransContextRef& txc,
   return r;
 }
 
+int NewStore::_zero(TransContextRef& txc,
+		    CollectionRef& c,
+		    const ghobject_t& oid,
+		    uint64_t offset, size_t len)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset << "~" << length
+	   << dendl;
+  int r = 0;
+
+  assert(0 == "write me");
+
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset << "~" << length
+	   << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_truncate(TransContextRef& txc,
+			CollectionRef& c,
+			const ghobject_t& oid,
+			uint64_t offset)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset
+	   << dendl;
+  int r = 0;
+
+  assert(0 == "write me");
+
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset
+	   << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_remove(TransContextRef& txc,
+		      CollectionRef& c,
+		      const ghobject_t& oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r;
+
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+
+  o->exists = false;
+  o->size = 0;
+  for (map<uint64_t,fragment_t>::iterator p = o->onode.data_map.begin();
+       p != o->onode.data_map.end();
+       ++p) {
+    txc->remove_fid(p->fid);
+  }
+  o->onode.data_map.clear();
+  txc.write_onode(o);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_setattr(TransContextRef& txc,
+		       CollectionRef& c,
+		       const ghobject_t& oid,
+		       const string& name,
+		       bufferptr& val)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << name << " (" << val.length() << " bytes)"
+	   << dendl;
+  int r = 0;
+
+  OnodeRef& o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  o->attrs[name] = val;
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << name << " (" << val.length() << " bytes)"
+	   << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_setattrs(TransContextRef& txc,
+			CollectionRef& c,
+			const ghobject_t& oid,
+			const map<string,bufferptr>& aset)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << aset.size() << " keys"
+	   << dendl;
+  int r = 0;
+
+  OnodeRef& o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  for (map<string,bufferptr>::iterator p = aset.begin(); p != aset.end(); ++p)
+    o->attrs[p->first] = p->second;
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << aset.size() << " keys"
+	   << " = " << r << dendl;
+  return r;
+}
+
+
+int NewStore::_rmattr(TransContextRef& txc,
+		      CollectionRef& c,
+		      const ghobject_t& oid,
+		      const string& name)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << name << dendl;
+  int r = 0;
+
+  OnodeRef& o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  o->attrs.erase(name);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << name << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_rmattrs(TransContextRef& txc,
+		       CollectionRef& c,
+		       const ghobject_t& oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r = 0;
+
+  OnodeRef& o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  o->attrs.clear();
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_clone(TransContextRef& txc,
+		     CollectionRef& c,
+		     const ghobject_t& old_oid,
+		     const ghobject_t& new_oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << old_oid << " -> "
+	   << new_oid << dendl;
+  int r = 0;
+
+  assert(0 == "writ eme");
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << old_oid << " -> "
+	   << new_oid << " = " << r << dendl;
+  return r;
+}
+
+
+int NewStore::_create_collection(TransContextRef& txc, coll_t cid)
+{
+  dout(15) << __func__ << " " << cid << dendl;
+  int r;
+  CollectionRef c;
+  bufferlist empty;
+
+  {
+    RWLock::RLocker l(coll_lock);
+    ceph::unordered_map<coll_t,CollectionRef>::iterator cp = coll_map.find(cid);
+    if (cp != coll_map.end()) {
+      r = -EEXIST;
+      goto out;
+    }
+    c = new Collection(cid);
+    coll_map[cid] = c;
+  }
+  txc.t->set(PREFIX_COLL, stringify(cid), empty);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << cid << " = " << r << dendl;
+  return r;
+}
+
+
 
 
 // ---------------------------
@@ -574,9 +799,11 @@ int NewStore::queue_transactions(
   ObjectStore::Transaction::collect_contexts(
     tls, &onreadable, &ondisk, &onreadable_sync);
 
+  TransContext txc;
+
   // XXX do it sync for now; this is not crash safe
   for (list<Transaction*>::iterator p = tls.begin(); p != tls.end(); ++p) {
-    _do_transaction(*p, handle);
+    _do_transaction(*p, &txc, handle);
   }
 
   if (onreadable_sync)
@@ -591,7 +818,342 @@ int NewStore::queue_transactions(
     finisher.queue(oncommit);
 }
 
-int NewStore::_do_transaction(Transaction *t, ThreadPool::TPHandle *handle)
+int NewStore::_do_transaction(Transaction *t,
+			      TransContextRef& txc,
+			      ThreadPool::TPHandle *handle)
 {
+  Transaction::iterator i = t.begin();
+  int pos = 0;
 
+  vector<CollectionRef> cvec(t->colls.size());
+  unsigned i = 0;
+  for (vector<coll_t>::iterator p = t->colls.begin(); p != t->colls.end();
+       ++p, ++i) {
+    cvec[i] = _get_collection(*p);
+  }
+
+  while (i.have_op()) {
+    Transaction::Op *op = i.decode_op();
+    int r = 0;
+    CollectionRef &c = cvec[op->cid];
+
+    switch (op->op) {
+    case Transaction::OP_NOP:
+      break;
+    case Transaction::OP_TOUCH:
+      {
+        const ghobject_t &oid = i.get_oid(op->oid);
+	r = _touch(c, oid);
+      }
+      break;
+
+    case Transaction::OP_WRITE:
+      {
+        const ghobject_t &oid = i.get_oid(op->oid);
+        uint64_t off = op->off;
+        uint64_t len = op->len;
+	uint32_t fadvise_flags = i.get_fadvise_flags();
+        bufferlist bl;
+        i.decode_bl(bl);
+	r = _write(txc, c, oid, off, len, bl, fadvise_flags);
+      }
+      break;
+
+    case Transaction::OP_ZERO:
+      {
+        const ghobject_t &oid = i.get_oid(op->oid);
+        uint64_t off = op->off;
+        uint64_t len = op->len;
+	r = _zero(cid, oid, off, len);
+      }
+      break;
+
+    case Transaction::OP_TRIMCACHE:
+      {
+        // deprecated, no-op
+      }
+      break;
+
+    case Transaction::OP_TRUNCATE:
+      {
+        const ghobject_t& oid = i.get_oid(op->oid);
+        uint64_t off = op->off;
+	r = _truncate(c, oid, off);
+      }
+      break;
+
+    case Transaction::OP_REMOVE:
+      {
+        const ghobject_t& oid = i.get_oid(op->oid);
+	r = _remove(c, oid);
+      }
+      break;
+
+    case Transaction::OP_SETATTR:
+      {
+        const ghobject_t &oid = i.get_oid(op->oid);
+        string name = i.decode_string();
+        bufferlist bl;
+        i.decode_bl(bl);
+	map<string, bufferptr> to_set;
+	to_set[name] = bufferptr(bl.c_str(), bl.length());
+	r = _setattrs(c, oid, to_set);
+      }
+      break;
+
+    case Transaction::OP_SETATTRS:
+      {
+        const ghobject_t& oid = i.get_oid(op->oid);
+        map<string, bufferptr> aset;
+        i.decode_attrset(aset);
+	r = _setattrs(c, oid, aset);
+      }
+      break;
+
+    case Transaction::OP_RMATTR:
+      {
+        const ghobject_t &oid = i.get_oid(op->oid);
+	string name = i.decode_string();
+	r = _rmattr(c, oid, name);
+      }
+      break;
+
+    case Transaction::OP_RMATTRS:
+      {
+        const ghobject_t &oid = i.get_oid(op->oid);
+	r = _rmattrs(c, oid);
+      }
+      break;
+
+    case Transaction::OP_CLONE:
+      {
+        const ghobject_t& oid = i.get_oid(op->oid);
+        const ghobject_t& noid = i.get_oid(op->dest_oid);
+	r = _clone(c, oid, noid);
+      }
+      break;
+
+    case Transaction::OP_CLONERANGE:
+      assert(0 == "deprecated");
+      break;
+
+    case Transaction::OP_CLONERANGE2:
+      {
+        const ghobject_t &oid = i.get_oid(op->oid);
+        const ghobject_t &noid = i.get_oid(op->dest_oid);
+        uint64_t srcoff = op->off;
+        uint64_t len = op->len;
+        uint64_t dstoff = op->dest_off;
+	assert(0 == "write me");
+	//r = _clone_range(cid, oid, noid, srcoff, len, dstoff);
+      }
+      break;
+
+    case Transaction::OP_MKCOLL:
+      {
+	assert(!c);
+        coll_t cid = i.get_cid(op->cid);
+	r = _create_collection(cid);
+      }
+      break;
+
+    case Transaction::OP_COLL_HINT:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        uint32_t type = op->hint_type;
+        bufferlist hint;
+        i.decode_bl(hint);
+        bufferlist::iterator hiter = hint.begin();
+        if (type == Transaction::COLL_HINT_EXPECTED_NUM_OBJECTS) {
+          uint32_t pg_num;
+          uint64_t num_objs;
+          ::decode(pg_num, hiter);
+          ::decode(num_objs, hiter);
+          r = _collection_hint_expected_num_objs(cid, pg_num, num_objs);
+        } else {
+          // Ignore the hint
+          dout(10) << "Unrecognized collection hint type: " << type << dendl;
+        }
+      }
+      break;
+
+    case Transaction::OP_RMCOLL:
+      {
+        coll_t cid = i.get_cid(op->cid);
+	r = _destroy_collection(cid);
+      }
+      break;
+
+    case Transaction::OP_COLL_ADD:
+      {
+        coll_t ocid = i.get_cid(op->cid);
+        coll_t ncid = i.get_cid(op->dest_cid);
+        ghobject_t oid = i.get_oid(op->oid);
+	r = _collection_add(ncid, ocid, oid);
+      }
+      break;
+
+    case Transaction::OP_COLL_REMOVE:
+       {
+        coll_t cid = i.get_cid(op->cid);
+        ghobject_t oid = i.get_oid(op->oid);
+	r = _remove(cid, oid);
+       }
+      break;
+
+    case Transaction::OP_COLL_MOVE:
+      assert(0 == "deprecated");
+      break;
+
+    case Transaction::OP_COLL_MOVE_RENAME:
+      {
+        coll_t oldcid = i.get_cid(op->cid);
+        ghobject_t oldoid = i.get_oid(op->oid);
+        coll_t newcid = i.get_cid(op->dest_cid);
+        ghobject_t newoid = i.get_oid(op->dest_oid);
+	r = _collection_move_rename(oldcid, oldoid, newcid, newoid);
+      }
+      break;
+
+    case Transaction::OP_COLL_SETATTR:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        string name = i.decode_string();
+        bufferlist bl;
+        i.decode_bl(bl);
+	assert(0 == "not implemented");
+      }
+      break;
+
+    case Transaction::OP_COLL_RMATTR:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        string name = i.decode_string();
+	assert(0 == "not implemented");
+      }
+      break;
+
+    case Transaction::OP_COLL_RENAME:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        ghobject_t oid = i.get_oid(op->oid);
+	r = -EOPNOTSUPP;
+      }
+      break;
+
+    case Transaction::OP_OMAP_CLEAR:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        ghobject_t oid = i.get_oid(op->oid);
+	r = _omap_clear(cid, oid);
+      }
+      break;
+    case Transaction::OP_OMAP_SETKEYS:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        ghobject_t oid = i.get_oid(op->oid);
+        map<string, bufferlist> aset;
+        i.decode_attrset(aset);
+	r = _omap_setkeys(cid, oid, aset);
+      }
+      break;
+    case Transaction::OP_OMAP_RMKEYS:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        ghobject_t oid = i.get_oid(op->oid);
+        set<string> keys;
+        i.decode_keyset(keys);
+	r = _omap_rmkeys(cid, oid, keys);
+      }
+      break;
+    case Transaction::OP_OMAP_RMKEYRANGE:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        ghobject_t oid = i.get_oid(op->oid);
+        string first, last;
+        first = i.decode_string();
+        last = i.decode_string();
+	r = _omap_rmkeyrange(cid, oid, first, last);
+      }
+      break;
+    case Transaction::OP_OMAP_SETHEADER:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        ghobject_t oid = i.get_oid(op->oid);
+        bufferlist bl;
+        i.decode_bl(bl);
+	r = _omap_setheader(cid, oid, bl);
+      }
+      break;
+    case Transaction::OP_SPLIT_COLLECTION:
+      assert(0 == "deprecated");
+      break;
+    case Transaction::OP_SPLIT_COLLECTION2:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        uint32_t bits = op->split_bits;
+        uint32_t rem = op->split_rem;
+        coll_t dest = i.get_cid(op->dest_cid);
+	r = _split_collection(cid, bits, rem, dest);
+      }
+      break;
+
+    case Transaction::OP_SETALLOCHINT:
+      {
+        coll_t cid = i.get_cid(op->cid);
+        ghobject_t oid = i.get_oid(op->oid);
+      }
+      break;
+
+    default:
+      derr << "bad op " << op->op << dendl;
+      assert(0);
+    }
+
+    if (r < 0) {
+      bool ok = false;
+
+      if (r == -ENOENT && !(op->op == Transaction::OP_CLONERANGE ||
+			    op->op == Transaction::OP_CLONE ||
+			    op->op == Transaction::OP_CLONERANGE2 ||
+			    op->op == Transaction::OP_COLL_ADD))
+	// -ENOENT is usually okay
+	ok = true;
+      if (r == -ENODATA)
+	ok = true;
+
+      if (!ok) {
+	const char *msg = "unexpected error code";
+
+	if (r == -ENOENT && (op->op == Transaction::OP_CLONERANGE ||
+			     op->op == Transaction::OP_CLONE ||
+			     op->op == Transaction::OP_CLONERANGE2))
+	  msg = "ENOENT on clone suggests osd bug";
+
+	if (r == -ENOSPC)
+	  // For now, if we hit _any_ ENOSPC, crash, before we do any damage
+	  // by partially applying transactions.
+	  msg = "ENOSPC handling not implemented";
+
+	if (r == -ENOTEMPTY) {
+	  msg = "ENOTEMPTY suggests garbage data in osd data dir";
+	  dump_all();
+	}
+
+	dout(0) << " error " << cpp_strerror(r) << " not handled on operation " << op->op
+		<< " (op " << pos << ", counting from 0)" << dendl;
+	dout(0) << msg << dendl;
+	dout(0) << " transaction dump:\n";
+	JSONFormatter f(true);
+	f.open_object_section("transaction");
+	t.dump(&f);
+	f.close_section();
+	f.flush(*_dout);
+	*_dout << dendl;
+	assert(0 == "unexpected error");
+      }
+    }
+
+    ++pos;
+  }
 }
