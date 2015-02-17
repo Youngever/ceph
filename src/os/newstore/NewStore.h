@@ -20,14 +20,16 @@
 #include "include/memory.h"
 #include "common/Finisher.h"
 #include "common/RWLock.h"
+#include "common/shared_cache.hpp"
 #include "os/ObjectStore.h"
+#include "os/KeyValueDB.h"
 
 #include "newstore_types.h"
 
 class NewStore : public ObjectStore {
-
   // -----------------------------------------------------
   // types
+public:
 
   struct FragmentHandle {
     int fd;
@@ -48,37 +50,41 @@ class NewStore : public ObjectStore {
 
   /// an in-memory object
   struct Onode {
-    onode_t onode;
-    bool dirty;  // ???
+    ghobject_t oid;
+    string key;     ///< key under PREFIX_OBJ where we are stored
+    onode_t onode;  ///< metadata stored as value in kv store
+    bool dirty;     // ???
     bool exists;
 
-    Onode() : dirty(false), exists(true) {}
+    Onode(const ghobject_t& o, const string& k);
   };
+  typedef ceph::shared_ptr<Onode> OnodeRef;
 
   struct Collection {
+    NewStore *store;
     coll_t cid;
     RWLock lock;
 
     // cache onodes on a per-collection basis to avoid lock
     // contention.
-    SharedLRU<ghobject_t,OnodeRef> onode_map;
+    SharedLRU<ghobject_t,Onode> onode_map;
 
     OnodeRef get_onode(const ghobject_t& oid, bool create);
 
-    Collection(coll_t c)
-      : cid(c),
+    Collection(NewStore *ns, coll_t c)
+      : store(ns),
+	cid(c),
 	lock("NewStore::Collection::lock")
     {}
   };
   typedef ceph::shared_ptr<Collection> CollectionRef;
 
-
   class OmapIteratorImpl : public ObjectMap::ObjectMapIteratorImpl {
     CollectionRef c;
-    ObjectRef o;
+    OnodeRef o;
     //map<string,bufferlist>::iterator it;
   public:
-    OmapIteratorImpl(CollectionRef c, ObjectRef o)
+    OmapIteratorImpl(CollectionRef c, OnodeRef o)
       : c(c), o(o) /*, it(o->omap.begin())*/ {}
 
     int seek_to_first() {
@@ -123,25 +129,57 @@ class NewStore : public ObjectStore {
     list<OnodeRef> onodes;     ///< these onodes need to be updated/written
     KeyValueDB::Transaction t; ///< then we will commit this
     list<fid_t> remove;        ///< later, these fids need to be removed
+    list<Context*> oncommit;   ///< signal on commit
 
     void sync_fd(int f) {
       fds.push_back(f);
     }
-    int wait_sync();
-
     void write_onode(OnodeRef &o) {
       onodes.push_back(o);
     }
-
     void remove_fid(fid_t f) {
       remove.push_back(f);
     }
-
   };
-  typedef ceph:shared_ptr<TransContextRef> TransContextRef;
+  typedef ceph::shared_ptr<TransContext> TransContextRef;
+
+
+  class OpSequencer : public Sequencer_impl {
+    Mutex qlock;
+    Cond qcond;
+    list<TransContextRef> q;  ///< transactions
+  public:
+    Sequencer *parent;
+
+    OpSequencer()
+      : qlock("NewStore::OpSequencer::qlock", false, false),
+	parent(NULL) {
+    }
+    ~OpSequencer() {
+      assert(q.empty());
+    }
+
+    void flush() {
+      Mutex::Locker l(qlock);
+      while (!q.empty())
+	qcond.Wait(qlock);
+    }
+
+    bool flush_commit(Context *c) {
+      Mutex::Locker l(qlock);
+      if (q.empty()) {
+	delete c;
+	return true;
+      }
+      q.back()->oncommit.push_back(c); /// XXX onreadable?
+      return false;
+    }
+  };
+
 
   // --------------------------------------------------------
   // members
+private:
   KeyValueDB *db;
   uuid_d fsid;
   int path_fd;  ///< open handle to $path
@@ -159,6 +197,8 @@ class NewStore : public ObjectStore {
   Finisher finisher;
   Logger *logger;
 
+  Sequencer default_osr;
+
 
   // --------------------------------------------------------
   // private methods
@@ -171,17 +211,18 @@ class NewStore : public ObjectStore {
   int _open_fsid(bool create);
   int _lock_fsid();
   int _read_fsid(uuid_d *f);
+  int _write_fsid();
   void _close_fsid();
   int _open_frag();
   int _create_frag();
-  void close_frag();
+  void _close_frag();
   int _open_db();
   void _close_db();
 
   CollectionRef _get_collection(coll_t cid);
 
   int _open_next_fid(fid_t *fid);
-
+  int _finalize_txc(OpSequencer *osr, TransContextRef& txc);
 
 public:
   NewStore(CephContext *cct, const string& path);
@@ -203,7 +244,9 @@ public:
   }
 
   int mkfs();
-  int mkjournal();
+  int mkjournal() {
+    return 0;
+  }
 
 private:
   bool sharded;
@@ -288,13 +331,20 @@ public:
     const ghobject_t &oid  ///< [in] object
     );
 
-  void set_fsid(uuid_d u);
-  uuid_d get_fsid();
+  void set_fsid(uuid_d u) {
+    fsid = u;
+  }
+  uuid_d get_fsid() {
+    return fsid;
+  }
 
-  objectstore_perf_stat_t get_cur_stats();
+  objectstore_perf_stat_t get_cur_stats() {
+    return objectstore_perf_stat_t();
+  }
 
   int queue_transactions(
-    Sequencer *osr, list<Transaction*>& tls,
+    Sequencer *osr,
+    list<Transaction*>& tls,
     TrackedOpRef op = TrackedOpRef(),
     ThreadPool::TPHandle *handle = NULL);
 
@@ -302,16 +352,58 @@ private:
   // --------------------------------------------------------
   // write ops
 
-  int _do_transaction(Transaction *t);
+  int _do_transaction(Transaction *t,
+		      TransContextRef& txc,
+		      ThreadPool::TPHandle *handle);
 
   int _write(TransContextRef& txc,
 	     CollectionRef& c,
 	     const ghobject_t& oid,
 	     uint64_t offset, size_t len,
 	     const bufferlist& bl,
-	     uint32_t fadvise_flags)
+	     uint32_t fadvise_flags);
+  int _touch(TransContextRef& txc,
+	     CollectionRef& c,
+	     const ghobject_t& oid);
+  int _zero(TransContextRef& txc,
+	    CollectionRef& c,
+	    const ghobject_t& oid,
+	    uint64_t offset, size_t len);
+  int _truncate(TransContextRef& txc,
+		CollectionRef& c,
+		const ghobject_t& oid,
+		uint64_t offset);
+  int _remove(TransContextRef& txc,
+	      CollectionRef& c,
+	      const ghobject_t& oid);
+  int _setattr(TransContextRef& txc,
+	       CollectionRef& c,
+	       const ghobject_t& oid,
+	       const string& name,
+	       bufferptr& val);
+  int _setattrs(TransContextRef& txc,
+		CollectionRef& c,
+		const ghobject_t& oid,
+		const map<string,bufferptr>& aset);
+  int _rmattr(TransContextRef& txc,
+	      CollectionRef& c,
+	      const ghobject_t& oid,
+	      const string& name);
+  int _rmattrs(TransContextRef& txc,
+	       CollectionRef& c,
+	       const ghobject_t& oid);
+  int _clone(TransContextRef& txc,
+	     CollectionRef& c,
+	     const ghobject_t& old_oid,
+	     const ghobject_t& new_oid);
+  int _create_collection(TransContextRef& txc, coll_t cid);
+  int _remove_collection(TransContextRef& txc, coll_t cid);
+
 
 };
 
+inline ostream& operator<<(ostream& out, const NewStore::OpSequencer& s) {
+  return out << *s.parent;
+}
 
 #endif

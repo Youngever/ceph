@@ -15,6 +15,13 @@
 #ifndef CEPH_OSD_NEWSTORE_TYPES_H
 #define CEPH_OSD_NEWSTORE_TYPES_H
 
+#include <ostream>
+#include "include/types.h"
+
+namespace ceph {
+  class Formatter;
+}
+
 /// unique id for a local file
 struct fid_t {
   uint32_t fset, fno;
@@ -29,18 +36,12 @@ struct fid_t {
     ::decode(fset, p);
     ::decode(fno, p);
   }
-  void dump(Formatter *f) {
-    f->dump_unsigned("fset", fset);
-    f->dump_unsigned("fno", fno);
-  }
-  static void generate_test_instances(list<onode_t*>& o) {
-    o->push_back(new fid_t());
-    o->push_back(new fid_t(0, 1));
-    o->push_back(new fid_t(123, 3278));
-  }
+  void dump(Formatter *f) const;
+  static void generate_test_instances(list<fid_t*>& o);
 };
+WRITE_CLASS_ENCODER(fid_t)
 
-static inline operator<<(ostream& out, const fid_t& fid) {
+static inline ostream& operator<<(ostream& out, const fid_t& fid) {
   return out << fid.fset << "/" << fid.fno;
 }
 
@@ -56,9 +57,10 @@ struct fragment_t {
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& p);
-  void dump(Formatter *f);
+  void dump(Formatter *f) const;
   static void generate_test_instances(list<fragment_t*>& o);
 };
+WRITE_CLASS_ENCODER(fragment_t)
 
 /// onode: per-object metadata
 struct onode_t {
@@ -71,8 +73,9 @@ struct onode_t {
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& p);
-  void dump(Formatter *f);
+  void dump(Formatter *f) const;
   static void generate_test_instances(list<onode_t*>& o);
 };
+WRITE_CLASS_ENCODER(onode_t)
 
 #endif

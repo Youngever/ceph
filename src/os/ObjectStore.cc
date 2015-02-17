@@ -19,6 +19,7 @@
 #include "FileStore.h"
 #include "MemStore.h"
 #include "KeyValueStore.h"
+#include "newstore/NewStore.h"
 #include "common/safe_io.h"
 
 ObjectStore *ObjectStore::create(CephContext *cct,
@@ -36,6 +37,9 @@ ObjectStore *ObjectStore::create(CephContext *cct,
   if (type == "keyvaluestore" &&
       cct->check_experimental_feature_enabled("keyvaluestore")) {
     return new KeyValueStore(data);
+  }
+  if (type == "newstore") {
+    return new NewStore(cct, data);
   }
   return NULL;
 }

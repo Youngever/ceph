@@ -754,6 +754,10 @@ OPTION(osd_bench_duration, OPT_U32, 30) // duration of 'osd bench', capped at 30
 
 OPTION(memstore_device_bytes, OPT_U64, 1024*1024*1024)
 
+OPTION(newstore_max_dir_size, OPT_U32, 10000)
+OPTION(newstore_backend, OPT_STR, "leveldb")
+OPTION(newstore_fail_eio, OPT_BOOL, true)
+
 OPTION(filestore_omap_backend, OPT_STR, "leveldb")
 
 OPTION(filestore_debug_disable_sharded_check, OPT_BOOL, false)

@@ -13,6 +13,20 @@
  */
 
 #include "newstore_types.h"
+#include "common/Formatter.h"
+
+void fid_t::dump(Formatter *f) const
+{
+  f->dump_unsigned("fset", fset);
+  f->dump_unsigned("fno", fno);
+}
+
+void fid_t::generate_test_instances(list<fid_t*>& o)
+{
+  o.push_back(new fid_t());
+  o.push_back(new fid_t(0, 1));
+  o.push_back(new fid_t(123, 3278));
+}
 
 void fragment_t::encode(bufferlist& bl) const
 {
@@ -39,11 +53,11 @@ void fragment_t::dump(Formatter *f) const
   f->dump_object("fid", fid);
 }
 
-void fragment_t::generate_test_instance(list<fragment_t*>& o)
+void fragment_t::generate_test_instances(list<fragment_t*>& o)
 {
-  o->push_back(new fragment_t());
-  o->push_back(new fragment_t(123, 456));
-  o->push_back(new fragment_t(789, 1024, fid_t(3, 400)));
+  o.push_back(new fragment_t());
+  o.push_back(new fragment_t(123, 456));
+  o.push_back(new fragment_t(789, 1024, fid_t(3, 400)));
 }
 
 
@@ -71,7 +85,7 @@ void onode_t::dump(Formatter *f) const
 {
   f->dump_unsigned("size", size);
   f->open_object_section("attrs");
-  for (map<string,bufferlist>::const_iterator p = attrs.begin();
+  for (map<string,bufferptr>::const_iterator p = attrs.begin();
        p != attrs.end(); ++p) {
     f->open_object_section("attr");
     f->dump_string("name", p->first);
@@ -90,8 +104,8 @@ void onode_t::dump(Formatter *f) const
   f->dump_unsigned("omap_head", omap_head);
 }
 
-void onode_t::generate_test_instance(list<onode_t*>& o)
+void onode_t::generate_test_instances(list<onode_t*>& o)
 {
-  o->push_back(new onode_t());
+  o.push_back(new onode_t());
   // FIXME
 }
