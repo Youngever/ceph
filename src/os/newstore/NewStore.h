@@ -222,6 +222,7 @@ private:
   CollectionRef _get_collection(coll_t cid);
 
   int _open_next_fid(fid_t *fid);
+  TransContext *_create_txc(OpSequencer *osr);
   int _finalize_txc(OpSequencer *osr, TransContextRef& txc);
 
 public:

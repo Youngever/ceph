@@ -126,8 +126,10 @@ static void get_object_key(const ghobject_t& oid, string *key)
 NewStore::NewStore(CephContext *cct, const string& path)
   : ObjectStore(path),
     db(NULL),
+    path_fd(-1),
     fsid_fd(-1),
     frag_fd(-1),
+    fset_fd(-1),
     mounted(false),
     coll_lock("NewStore::coll_lock"),
     fid_lock("NewStore::fid_lock"),
@@ -392,6 +394,7 @@ int NewStore::mkfs()
 
   dout(10) << __func__ << " success" << dendl;
   r = 0;
+  _close_db();
 
  out_close_frag:
   _close_frag();
@@ -451,11 +454,14 @@ int NewStore::umount()
 {
   assert(mounted);
   dout(1) << __func__ << dendl;
+  mounted = false;
   if (fset_fd >= 0)
     VOID_TEMP_FAILURE_RETRY(::close(fset_fd));
   finisher.stop();
   _close_db();
+  _close_frag();
   _close_fsid();
+  _close_path();
   return 0;
 }
 
@@ -744,6 +750,14 @@ int NewStore::_open_next_fid(fid_t *fid)
     return r;
   }
   return r;
+}
+
+NewStore::TransContext *NewStore::_create_txc(OpSequencer *osr)
+{
+  TransContext *txc = new TransContext;
+  txc->t = db->get_transaction();
+  dout(20) << __func__ << " osr " << osr << " = " << txc << dendl;
+  return txc;
 }
 
 int NewStore::_finalize_txc(OpSequencer *osr, TransContextRef& txc)
@@ -1085,7 +1099,7 @@ int NewStore::queue_transactions(
     dout(5) << __func__ << " new " << *osr << "/" << osr->parent << dendl;
   }
 
-  TransContextRef txc(new TransContext());
+  TransContextRef txc(_create_txc(osr));
 
   // XXX do it sync for now; this is not crash safe
   for (list<Transaction*>::iterator p = tls.begin(); p != tls.end(); ++p) {
