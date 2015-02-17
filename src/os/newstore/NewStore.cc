@@ -786,8 +786,10 @@ int NewStore::_touch(TransContextRef& txc,
 {
   dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
   int r = 0;
+  RWLock::WLocker l(c->lock);
   OnodeRef o = c->get_onode(oid, true);
   txc->write_onode(o);
+ out:
   dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
   return r;
 }
@@ -803,7 +805,7 @@ int NewStore::_write(TransContextRef& txc,
 	   << " " << offset << "~" << length
 	   << dendl;
   int r;
-
+  RWLock::WLocker l(c->lock);
   OnodeRef o = c->get_onode(oid, true);
   int fd;
   if (o->onode.size == 0) {
@@ -1012,22 +1014,23 @@ int NewStore::_clone(TransContextRef& txc,
 
 // collections
 
-int NewStore::_create_collection(TransContextRef& txc, coll_t cid)
+int NewStore::_create_collection(
+  TransContextRef& txc,
+  coll_t cid,
+  CollectionRef *c)
 {
   dout(15) << __func__ << " " << cid << dendl;
   int r;
-  CollectionRef c;
   bufferlist empty;
 
   {
-    RWLock::RLocker l(coll_lock);
-    ceph::unordered_map<coll_t,CollectionRef>::iterator cp = coll_map.find(cid);
-    if (cp != coll_map.end()) {
+    RWLock::WLocker l(coll_lock);
+    if (*c) {
       r = -EEXIST;
       goto out;
     }
-    c.reset(new Collection(this, cid));
-    coll_map[cid] = c;
+    c->reset(new Collection(this, cid));
+    coll_map[cid] = *c;
   }
   txc->t->set(PREFIX_COLL, stringify(cid), empty);
   r = 0;
@@ -1037,26 +1040,25 @@ int NewStore::_create_collection(TransContextRef& txc, coll_t cid)
   return r;
 }
 
-int NewStore::_remove_collection(TransContextRef& txc, coll_t cid)
+int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
+				 CollectionRef *c)
 {
   dout(15) << __func__ << " " << cid << dendl;
   int r;
-  CollectionRef c;
   bufferlist empty;
 
   {
-    RWLock::RLocker l(coll_lock);
-    ceph::unordered_map<coll_t,CollectionRef>::iterator cp = coll_map.find(cid);
-    if (cp == coll_map.end()) {
+    RWLock::WLocker l(coll_lock);
+    if (!*c) {
       r = -ENOENT;
       goto out;
     }
-    CollectionRef c = cp->second;
-    if (!c->onode_map.empty()) {  // XXX
+    if (!(*c)->onode_map.empty()) {  // XXX
       r = -ENOTEMPTY;
       goto out;
     }
     coll_map.erase(cid);
+    c->reset();
   }
   txc->t->rmkey(PREFIX_COLL, stringify(cid));
   r = 0;
@@ -1270,7 +1272,7 @@ int NewStore::_do_transaction(Transaction *t,
       {
 	assert(!c);
         coll_t cid = i.get_cid(op->cid);
-	r = _create_collection(txc, cid);
+	r = _create_collection(txc, cid, &c);
       }
       break;
 
@@ -1298,7 +1300,7 @@ int NewStore::_do_transaction(Transaction *t,
     case Transaction::OP_RMCOLL:
       {
         coll_t cid = i.get_cid(op->cid);
-	r = _remove_collection(txc, cid);
+	r = _remove_collection(txc, cid, &c);
       }
       break;
 

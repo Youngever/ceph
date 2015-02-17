@@ -397,8 +397,8 @@ private:
 	     CollectionRef& c,
 	     const ghobject_t& old_oid,
 	     const ghobject_t& new_oid);
-  int _create_collection(TransContextRef& txc, coll_t cid);
-  int _remove_collection(TransContextRef& txc, coll_t cid);
+  int _create_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
+  int _remove_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
 
 
 };
