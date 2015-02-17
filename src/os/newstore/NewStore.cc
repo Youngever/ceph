@@ -28,11 +28,6 @@ const string PREFIX_COLL = "C"; // collection name -> (nothing)
 const string PREFIX_OBJ = "O";  // object name -> onode
 const string PREFIX_WAL = "L";  // write ahead log
 
-#define dout_subsys ceph_subsys_filestore
-#undef dout_prefix
-#define dout_prefix *_dout << "newstore(" << path << ") "
-
-
 
 const char KEY_SEP_C = '!';
 const string KEY_SEP_S = "!";
@@ -120,8 +115,59 @@ static void get_object_key(const ghobject_t& oid, string *key)
   key->append(1, KEY_END);
 }
 
+// =======================================================
+
+#define dout_subsys ceph_subsys_filestore
+#undef dout_prefix
+#define dout_prefix *_dout << "newstore(" << store->path << ").collection(" << cid << ") "
+
+NewStore::OnodeRef NewStore::Collection::get_onode(
+  const ghobject_t& oid,
+  bool create)
+{
+  assert(create ? lock.is_wlocked() : lock.is_locked());
+
+  OnodeRef o = onode_map.lookup(oid);
+  if (o)
+    return o;
+
+  string key;
+  get_object_key(oid, &key);
+
+  dout(20) << __func__ << " oid " << oid << " key '" << key << "'" << dendl;
+
+  bufferlist v;
+  int r = store->db->get(PREFIX_OBJ, key, &v);
+  dout(20) << " r " << r << " v.len " << v.length() << dendl;
+  Onode *on;
+  assert(r >= 0);
+  if (v.length() == 0) {
+    if (!create)
+      return OnodeRef();
+
+    // new
+    on = new Onode(oid, key);
+    on->dirty = true;
+  } else {
+    // loaded
+    on = new Onode(oid, key);
+    bufferlist::iterator p = v.begin();
+    ::decode(o->onode, p);
+  }
+
+  onode_map.add(oid, on, NULL);
+  o.reset(on);
+  return o;
+}
+
+
 
 // =======================================================
+
+#define dout_subsys ceph_subsys_filestore
+#undef dout_prefix
+#define dout_prefix *_dout << "newstore(" << path << ") "
+
 
 NewStore::NewStore(CephContext *cct, const string& path)
   : ObjectStore(path),
@@ -487,40 +533,6 @@ NewStore::CollectionRef NewStore::_get_collection(coll_t cid)
   return cp->second;
 }
 
-NewStore::OnodeRef NewStore::Collection::get_onode(
-  const ghobject_t& oid,
-  bool create)
-{
-  assert(create ? lock.is_wlocked() : lock.is_locked());
-
-  OnodeRef o = onode_map.lookup(oid);
-  if (o)
-    return o;
-
-  string key;
-  get_object_key(oid, &key);
-
-  bufferlist v;
-  int r = store->db->get(PREFIX_OBJ, key, &v);
-  Onode *on;
-  if (r < 0) {
-    if (!create)
-      return OnodeRef();
-
-    // new
-    on = new Onode(oid, key);
-    o->dirty = true;
-  } else {
-    // loaded
-    on = new Onode(oid, key);
-    bufferlist::iterator p = v.begin();
-    ::decode(o->onode, p);
-  }
-
-  onode_map.add(oid, on, NULL);
-  return o;
-}
-
 NewStore::Onode::Onode(const ghobject_t& o, const string& k)
   : oid(o),
     key(k),
@@ -788,6 +800,8 @@ int NewStore::_touch(TransContextRef& txc,
   int r = 0;
   RWLock::WLocker l(c->lock);
   OnodeRef o = c->get_onode(oid, true);
+  assert(o);
+  o->exists = true;
   txc->write_onode(o);
  out:
   dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
@@ -874,13 +888,12 @@ int NewStore::_remove(TransContextRef& txc,
 {
   dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
   int r;
-
-  OnodeRef o = c->get_onode(oid, false);
+  RWLock::WLocker(c->lock);
+  OnodeRef o = c->get_onode(oid, true);
   if (!o || !o->exists) {
     r = -ENOENT;
     goto out;
   }
-
   o->exists = false;
   o->onode.size = 0;
   for (map<uint64_t,fragment_t>::iterator p = o->onode.data_map.begin();
