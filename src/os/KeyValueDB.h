@@ -88,7 +88,14 @@ public:
     ) = 0;
   virtual int get(const string &prefix, ///< [in] prefix
 		  const string &key,    ///< [in] key
-		  bufferlist *value);   ///< [out] value
+		  bufferlist *value) {  ///< [out] value
+    set<string> ks;
+    ks.insert(key);
+    map<string,bufferlist> om;
+    int r = get(prefix, ks, &om);
+    *value = om[key];
+    return r;
+  }
 
   class WholeSpaceIteratorImpl {
   public:
