@@ -117,7 +117,7 @@ static void get_object_key(const ghobject_t& oid, string *key)
 
 // =======================================================
 
-#define dout_subsys ceph_subsys_filestore
+#define dout_subsys ceph_subsys_newstore
 #undef dout_prefix
 #define dout_prefix *_dout << "newstore(" << store->path << ").collection(" << cid << ") "
 
@@ -162,7 +162,6 @@ NewStore::OnodeRef NewStore::Collection::get_onode(
 
 // =======================================================
 
-#define dout_subsys ceph_subsys_filestore
 #undef dout_prefix
 #define dout_prefix *_dout << "newstore(" << path << ") "
 
@@ -820,6 +819,7 @@ int NewStore::_write(TransContextRef& txc,
   RWLock::WLocker l(c->lock);
   OnodeRef o = c->get_onode(oid, true);
   int fd;
+
   if (o->onode.size == 0) {
     fragment_t &f = o->onode.data_map[0];
     f.offset = 0;

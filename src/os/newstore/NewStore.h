@@ -131,6 +131,8 @@ public:
     list<fid_t> remove;        ///< later, these fids need to be removed
     list<Context*> oncommit;   ///< signal on commit
 
+    wal_transaction_t *wal_txn; ///< wal transaction (if any)
+
     void sync_fd(int f) {
       fds.push_back(f);
     }

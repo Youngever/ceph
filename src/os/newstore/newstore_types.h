@@ -78,4 +78,38 @@ struct onode_t {
 };
 WRITE_CLASS_ENCODER(onode_t)
 
+
+/// writeahead-logged op
+struct wal_op_t {
+  typedef enum {
+    OP_WRITE = 1,
+    OP_TRUNCATE = 3,
+    OP_ZERO = 4,
+    OP_REMOVE = 5,
+  } type_t;
+  __u8 op;
+  fid_t fid;
+  uint64_t offset, length;
+  bufferlist bl;
+
+  void encode(bufferlist& bl) const;
+  void decode(bufferlist::iterator& p);
+  void dump(Formatter *f) const;
+  static void generate_test_instances(list<wal_op_t*>& o);
+};
+WRITE_CLASS_ENCODER(wal_op_t)
+
+
+/// writeahead-logged transaction
+struct wal_transaction_t {
+  uint64_t seq;
+  list<wal_op_t> ops;
+
+  void encode(bufferlist& bl) const;
+  void decode(bufferlist::iterator& p);
+  void dump(Formatter *f) const;
+  static void generate_test_instances(list<wal_transaction_t*>& o);
+};
+WRITE_CLASS_ENCODER(wal_transaction_t)
+
 #endif
