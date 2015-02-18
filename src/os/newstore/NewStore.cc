@@ -155,9 +155,7 @@ NewStore::OnodeRef NewStore::Collection::get_onode(
     ::decode(o->onode, p);
   }
 
-  onode_map.add(oid, on, NULL);
-  o.reset(on);
-  return o;
+  return onode_map.add(oid, on, NULL);
 }
 
 
@@ -888,7 +886,7 @@ int NewStore::_remove(TransContextRef& txc,
 {
   dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
   int r;
-  RWLock::WLocker(c->lock);
+  RWLock::WLocker l(c->lock);
   OnodeRef o = c->get_onode(oid, true);
   if (!o || !o->exists) {
     r = -ENOENT;
