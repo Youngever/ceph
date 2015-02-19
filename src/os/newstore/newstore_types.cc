@@ -109,3 +109,59 @@ void onode_t::generate_test_instances(list<onode_t*>& o)
   o.push_back(new onode_t());
   // FIXME
 }
+
+void wal_op_t::encode(bufferlist& bl) const
+{
+  ENCODE_START(1, 1, bl);
+  ::encode(op, bl);
+  ::encode(fid, bl);
+  ::encode(offset, bl);
+  ::encode(length, bl);
+  ::encode(data, bl);
+  ENCODE_FINISH(bl);
+}
+
+void wal_op_t::decode(bufferlist::iterator& p)
+{
+  DECODE_START(1, p);
+  ::decode(op, p);
+  ::decode(fid, p);
+  ::decode(offset, p);
+  ::decode(length, p);
+  ::decode(data, p);
+  DECODE_FINISH(p);
+}
+
+void wal_op_t::dump(Formatter *f) const
+{
+  f->dump_unsigned("op", (int)op);
+  f->dump_object("fid", fid);
+  f->dump_unsigned("offset", offset);
+  f->dump_unsigned("length", length);
+}
+
+void wal_transaction_t::encode(bufferlist& bl) const
+{
+  ENCODE_START(1, 1, bl);
+  ::encode(seq, bl);
+  ::encode(ops, bl);
+  ENCODE_FINISH(bl);
+}
+
+void wal_transaction_t::decode(bufferlist::iterator& p)
+{
+  DECODE_START(1, p);
+  ::decode(seq, p);
+  ::decode(ops, p);
+  DECODE_FINISH(p);
+}
+
+void wal_transaction_t::dump(Formatter *f) const
+{
+  f->dump_unsigned("seq", seq);
+  f->open_array_section("ops");
+  for (list<wal_op_t>::const_iterator p = ops.begin(); p != ops.end(); ++p) {
+    f->dump_object("op", *p);
+  }
+  f->close_section();
+}

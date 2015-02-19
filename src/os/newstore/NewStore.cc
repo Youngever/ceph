@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #include "NewStore.h"
 #include "include/compat.h"
@@ -176,6 +177,8 @@ NewStore::NewStore(CephContext *cct, const string& path)
     mounted(false),
     coll_lock("NewStore::coll_lock"),
     fid_lock("NewStore::fid_lock"),
+    wal_lock("NewStore::wal_lock"),
+    wal_seq(0),
     finisher(cct),
     logger(NULL),
     default_osr("default")
@@ -717,6 +720,16 @@ ObjectMap::ObjectMapIterator NewStore::get_omap_iterator(
 // -----------------
 // write helpers
 
+int NewStore::_open_fid(fid_t fid)
+{
+  char fn[32];
+  snprintf(fn, sizeof(fn), "%u/%u", cur_fid.fset, cur_fid.fno);
+  int fd = ::openat(frag_fd, fn, O_RDWR);
+  if (fd < 0)
+    return -errno;
+  return fd;
+}
+
 int NewStore::_open_next_fid(fid_t *fid)
 {
   {
@@ -728,7 +741,7 @@ int NewStore::_open_next_fid(fid_t *fid)
       cur_fid.fno = 1;
       dout(10) << __func__ << " creating " << cur_fid.fset << dendl;
       char s[32];
-      snprintf(s, sizeof(s), "%d", cur_fid.fset);
+      snprintf(s, sizeof(s), "%u", cur_fid.fset);
       int r = ::mkdirat(frag_fd, s, 0755);
       if (r < 0) {
 	r = -errno;
@@ -750,15 +763,35 @@ int NewStore::_open_next_fid(fid_t *fid)
 
   dout(10) << __func__ << " " << cur_fid << dendl;
   char s[32];
-  snprintf(s, sizeof(s), "%d", fid->fno);
-  int r = ::openat(fset_fd, s, O_RDWR|O_CREAT, 0644);
-  if (r < 0) {
-    r = -errno;
+  snprintf(s, sizeof(s), "%u", fid->fno);
+  int fd = ::openat(fset_fd, s, O_RDWR|O_CREAT, 0644);
+  if (fd < 0) {
+    int r = -errno;
     derr << __func__ << " cannot create " << path << "/fragments/"
 	 << *fid << ": " << cpp_strerror(r) << dendl;
     return r;
   }
-  return r;
+
+  // stash ino too for later
+  struct stat st;
+  int r = ::fstat(fd, &st);
+  if (r < 0) {
+    r = -errno;
+    VOID_TEMP_FAILURE_RETRY(::close(fd));
+    return r;
+  }
+  fid->ino = st.st_ino;
+  return fd;
+}
+
+int NewStore::_remove_fid(fid_t fid)
+{
+  char fn[32];
+  snprintf(fn, sizeof(fn), "%u/%u", cur_fid.fset, cur_fid.fno);
+  int r = ::unlinkat(frag_fd, fn, 0);
+  if (r < 0)
+    return -errno;
+  return 0;
 }
 
 NewStore::TransContext *NewStore::_create_txc(OpSequencer *osr)
@@ -782,305 +815,91 @@ int NewStore::_finalize_txc(OpSequencer *osr, TransContextRef& txc)
     txc->t->set(PREFIX_OBJ, (*p)->key, bl);
   }
 
+  // journal wal items
+  if (txc->wal_txn) {
+    txc->wal_txn->seq = wal_seq.inc();
+    bufferlist bl;
+    ::encode(*txc->wal_txn, bl);
+    txc->t->set(PREFIX_WAL, stringify(txc->wal_txn->seq), bl);
+  }
+
   return 0;
 }
 
-
-// -----------------
-// write operations
-
-int NewStore::_touch(TransContextRef& txc,
-		     CollectionRef& c,
-		     const ghobject_t& oid)
+wal_op_t *NewStore::_get_wal_op(TransContextRef& txc)
 {
-  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
-  int r = 0;
-  RWLock::WLocker l(c->lock);
-  OnodeRef o = c->get_onode(oid, true);
-  assert(o);
-  o->exists = true;
-  txc->write_onode(o);
- out:
-  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
-  return r;
+  if (!txc->wal_txn) {
+    txc->wal_txn = new wal_transaction_t;
+  }
+  txc->wal_txn->ops.push_back(wal_op_t());
+  return &txc->wal_txn->ops.back();
 }
 
-int NewStore::_write(TransContextRef& txc,
-		     CollectionRef& c,
-		     const ghobject_t& oid,
-		     uint64_t offset, size_t length,
-		     const bufferlist& bl,
-		     uint32_t fadvise_flags)
+int NewStore::_apply_wal_transaction(TransContextRef& txc)
 {
-  dout(15) << __func__ << " " << c->cid << " " << oid
-	   << " " << offset << "~" << length
-	   << dendl;
-  int r;
-  RWLock::WLocker l(c->lock);
-  OnodeRef o = c->get_onode(oid, true);
-  int fd;
+  wal_transaction_t& wt = *txc->wal_txn;
+  dout(20) << __func__ << " txc " << txc << " seq " << wt.seq << dendl;
 
-  if (o->onode.size == 0) {
-    fragment_t &f = o->onode.data_map[0];
-    f.offset = 0;
-    f.length = length;
-    fd = _open_next_fid(&f.fid);
-    if (fd < 0) {
-      r = fd;
-      goto out;
+  vector<int> sync_fds;
+  sync_fds.reserve(wt.ops.size());
+  for (list<wal_op_t>::iterator p = wt.ops.begin(); p != wt.ops.end(); ++p) {
+    switch (p->op) {
+    case wal_op_t::OP_WRITE:
+      {
+	dout(20) << __func__ << " write " << p->fid << " "
+		 << p->offset << "~" << p->length << dendl;
+	int fd = _open_fid(p->fid);
+	if (fd < 0)
+	  return fd;
+	int r = ::lseek64(fd, p->offset, SEEK_SET);
+	assert(r == 0);
+	p->data.write_fd(fd);
+	sync_fds.push_back(fd);
+      }
+      break;
+    case wal_op_t::OP_TRUNCATE:
+      {
+	dout(20) << __func__ << " truncate " << p->fid << " "
+		 << p->offset << dendl;
+	int fd = _open_fid(p->fid);
+	if (fd < 0)
+	  return fd;
+	int r = ::ftruncate(fd, p->offset);
+	assert(r == 0);
+	//sync_fds.push_back(fd);  // do we care?
+      }
+      break;
+
+    case wal_op_t::OP_REMOVE:
+      dout(20) << __func__ << " remove " << p->fid << dendl;
+      _remove_fid(p->fid);
+      break;
+
+    default:
+      assert(0 == "unrecognized wal op");
     }
-    o->onode.size = length;
-  } else {
-    assert(0 == "implement me");
   }
 
-  r = bl.write_fd(fd);
-  txc->sync_fd(fd);
-
- out:
-  dout(10) << __func__ << " " << c->cid << " " << oid
-	   << " " << offset << "~" << length
-	   << " = " << r << dendl;
-  return r;
-}
-
-int NewStore::_zero(TransContextRef& txc,
-		    CollectionRef& c,
-		    const ghobject_t& oid,
-		    uint64_t offset, size_t length)
-{
-  dout(15) << __func__ << " " << c->cid << " " << oid
-	   << " " << offset << "~" << length
-	   << dendl;
-  int r = 0;
-
-  assert(0 == "write me");
-
-  dout(10) << __func__ << " " << c->cid << " " << oid
-	   << " " << offset << "~" << length
-	   << " = " << r << dendl;
-  return r;
-}
-
-int NewStore::_truncate(TransContextRef& txc,
-			CollectionRef& c,
-			const ghobject_t& oid,
-			uint64_t offset)
-{
-  dout(15) << __func__ << " " << c->cid << " " << oid
-	   << " " << offset
-	   << dendl;
-  int r = 0;
-
-  assert(0 == "write me");
-
-  dout(10) << __func__ << " " << c->cid << " " << oid
-	   << " " << offset
-	   << " = " << r << dendl;
-  return r;
-}
-
-int NewStore::_remove(TransContextRef& txc,
-		      CollectionRef& c,
-		      const ghobject_t& oid)
-{
-  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
-  int r;
-  RWLock::WLocker l(c->lock);
-  OnodeRef o = c->get_onode(oid, true);
-  if (!o || !o->exists) {
-    r = -ENOENT;
-    goto out;
-  }
-  o->exists = false;
-  o->onode.size = 0;
-  for (map<uint64_t,fragment_t>::iterator p = o->onode.data_map.begin();
-       p != o->onode.data_map.end();
+  for (vector<int>::iterator p = sync_fds.begin();
+       p != sync_fds.end();
        ++p) {
-    txc->remove_fid(p->second.fid);
+    int r = ::fsync(*p);
+    assert(r == 0);
+    VOID_TEMP_FAILURE_RETRY(::close(*p));
   }
-  o->onode.data_map.clear();
-  txc->write_onode(o);
-  r = 0;
 
- out:
-  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
-  return r;
+  txc->finish_wal_apply();
+  return 0;
 }
 
-int NewStore::_setattr(TransContextRef& txc,
-		       CollectionRef& c,
-		       const ghobject_t& oid,
-		       const string& name,
-		       bufferptr& val)
-{
-  dout(15) << __func__ << " " << c->cid << " " << oid
-	   << " " << name << " (" << val.length() << " bytes)"
-	   << dendl;
-  int r = 0;
-
-  OnodeRef o = c->get_onode(oid, false);
-  if (!o || !o->exists) {
-    r = -ENOENT;
-    goto out;
+struct C_ApplyWAL : public Context {
+  NewStore *store;
+  NewStore::TransContextRef txc;
+  C_ApplyWAL(NewStore *s, NewStore::TransContextRef& t) : store(s), txc(t) {}
+  void finish(int r) {
+    store->_apply_wal_transaction(txc);
   }
-  o->onode.attrs[name] = val;
-  r = 0;
-
- out:
-  dout(10) << __func__ << " " << c->cid << " " << oid
-	   << " " << name << " (" << val.length() << " bytes)"
-	   << " = " << r << dendl;
-  return r;
-}
-
-int NewStore::_setattrs(TransContextRef& txc,
-			CollectionRef& c,
-			const ghobject_t& oid,
-			const map<string,bufferptr>& aset)
-{
-  dout(15) << __func__ << " " << c->cid << " " << oid
-	   << " " << aset.size() << " keys"
-	   << dendl;
-  int r = 0;
-
-  OnodeRef o = c->get_onode(oid, false);
-  if (!o || !o->exists) {
-    r = -ENOENT;
-    goto out;
-  }
-  for (map<string,bufferptr>::const_iterator p = aset.begin();
-       p != aset.end(); ++p)
-    o->onode.attrs[p->first] = p->second;
-  r = 0;
-
- out:
-  dout(10) << __func__ << " " << c->cid << " " << oid
-	   << " " << aset.size() << " keys"
-	   << " = " << r << dendl;
-  return r;
-}
-
-
-int NewStore::_rmattr(TransContextRef& txc,
-		      CollectionRef& c,
-		      const ghobject_t& oid,
-		      const string& name)
-{
-  dout(15) << __func__ << " " << c->cid << " " << oid
-	   << " " << name << dendl;
-  int r = 0;
-
-  OnodeRef o = c->get_onode(oid, false);
-  if (!o || !o->exists) {
-    r = -ENOENT;
-    goto out;
-  }
-  o->onode.attrs.erase(name);
-  r = 0;
-
- out:
-  dout(10) << __func__ << " " << c->cid << " " << oid
-	   << " " << name << " = " << r << dendl;
-  return r;
-}
-
-int NewStore::_rmattrs(TransContextRef& txc,
-		       CollectionRef& c,
-		       const ghobject_t& oid)
-{
-  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
-  int r = 0;
-
-  OnodeRef o = c->get_onode(oid, false);
-  if (!o || !o->exists) {
-    r = -ENOENT;
-    goto out;
-  }
-  o->onode.attrs.clear();
-  r = 0;
-
- out:
-  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
-  return r;
-}
-
-int NewStore::_clone(TransContextRef& txc,
-		     CollectionRef& c,
-		     const ghobject_t& old_oid,
-		     const ghobject_t& new_oid)
-{
-  dout(15) << __func__ << " " << c->cid << " " << old_oid << " -> "
-	   << new_oid << dendl;
-  int r = 0;
-
-  assert(0 == "writ eme");
-
- out:
-  dout(10) << __func__ << " " << c->cid << " " << old_oid << " -> "
-	   << new_oid << " = " << r << dendl;
-  return r;
-}
-
-
-// collections
-
-int NewStore::_create_collection(
-  TransContextRef& txc,
-  coll_t cid,
-  CollectionRef *c)
-{
-  dout(15) << __func__ << " " << cid << dendl;
-  int r;
-  bufferlist empty;
-
-  {
-    RWLock::WLocker l(coll_lock);
-    if (*c) {
-      r = -EEXIST;
-      goto out;
-    }
-    c->reset(new Collection(this, cid));
-    coll_map[cid] = *c;
-  }
-  txc->t->set(PREFIX_COLL, stringify(cid), empty);
-  r = 0;
-
- out:
-  dout(10) << __func__ << " " << cid << " = " << r << dendl;
-  return r;
-}
-
-int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
-				 CollectionRef *c)
-{
-  dout(15) << __func__ << " " << cid << dendl;
-  int r;
-  bufferlist empty;
-
-  {
-    RWLock::WLocker l(coll_lock);
-    if (!*c) {
-      r = -ENOENT;
-      goto out;
-    }
-    if (!(*c)->onode_map.empty()) {  // XXX
-      r = -ENOTEMPTY;
-      goto out;
-    }
-    coll_map.erase(cid);
-    c->reset();
-  }
-  txc->t->rmkey(PREFIX_COLL, stringify(cid));
-  r = 0;
-
- out:
-  dout(10) << __func__ << " " << cid << " = " << r << dendl;
-  return r;
-}
-
-
-
+};
 
 // ---------------------------
 // transactions
@@ -1144,6 +963,11 @@ int NewStore::queue_transactions(
 
   if (ondisk)
     finisher.queue(ondisk);
+
+  if (txc->wal_txn) {
+    txc->start_wal_apply();
+    finisher.queue(new C_ApplyWAL(this, txc));
+  }
 
   return 0;
 }
@@ -1475,6 +1299,362 @@ int NewStore::_do_transaction(Transaction *t,
 
   return 0;
 }
+
+
+
+// -----------------
+// write operations
+
+int NewStore::_touch(TransContextRef& txc,
+		     CollectionRef& c,
+		     const ghobject_t& oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r = 0;
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, true);
+  assert(o);
+  o->exists = true;
+  txc->write_onode(o);
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_write(TransContextRef& txc,
+		     CollectionRef& c,
+		     const ghobject_t& oid,
+		     uint64_t offset, size_t length,
+		     const bufferlist& bl,
+		     uint32_t fadvise_flags)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset << "~" << length
+	   << dendl;
+  int r;
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, true);
+  int fd;
+
+  if (o->onode.size == offset) {
+    if (o->onode.data_map.empty()) {
+      // create
+      fragment_t &f = o->onode.data_map[0];
+      f.offset = 0;
+      f.length = length;
+      fd = _open_next_fid(&f.fid);
+      if (fd < 0) {
+	r = fd;
+	goto out;
+      }
+      ::lseek64(fd, offset, SEEK_SET);
+    } else {
+      // append
+      assert(o->onode.data_map.size() == 1);
+      fragment_t &f = o->onode.data_map.rbegin()->second;
+      f.length += length;
+      fd = _open_fid(f.fid);
+      if (fd < 0) {
+	r = fd;
+	goto out;
+      }
+      ::lseek64(fd, offset, SEEK_SET);
+    }
+    o->onode.size = offset + length;
+  } else {
+    // WAL
+    assert(o->onode.data_map.size() == 1);
+    const fragment_t& f = o->onode.data_map.begin()->second;
+    assert(f.offset == 0);
+    wal_op_t *op = _get_wal_op(txc);
+    op->op = wal_op_t::OP_WRITE;
+    op->offset = offset;
+    op->length = length;
+    op->fid = f.fid;
+    op->data = bl;
+    if (offset + length > o->onode.size)
+      o->onode.size;
+  }
+
+  r = bl.write_fd(fd);
+  txc->sync_fd(fd);
+  txc->write_onode(o);
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset << "~" << length
+	   << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_zero(TransContextRef& txc,
+		    CollectionRef& c,
+		    const ghobject_t& oid,
+		    uint64_t offset, size_t length)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset << "~" << length
+	   << dendl;
+  int r = 0;
+
+  assert(0 == "write me");
+
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset << "~" << length
+	   << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_truncate(TransContextRef& txc,
+			CollectionRef& c,
+			const ghobject_t& oid,
+			uint64_t offset)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset
+	   << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, true);
+  if (!o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  if (offset == 0) {
+    while (!o->onode.data_map.empty()) {
+      txc->remove_fid(o->onode.data_map.rbegin()->second.fid);
+      o->onode.data_map.erase(o->onode.data_map.rbegin()->first);
+    }
+  } else if (offset < o->onode.size) {
+    assert(o->onode.data_map.size() == 1);
+    fragment_t& f = o->onode.data_map.begin()->second;
+    wal_op_t *op = _get_wal_op(txc);
+    op->op = wal_op_t::OP_TRUNCATE;
+    op->offset = offset;
+    op->fid = f.fid;
+    assert(f.offset == 0);
+    f.length = offset;
+  }
+  o->onode.size = offset;
+  txc->write_onode(o);
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset
+	   << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_remove(TransContextRef& txc,
+		      CollectionRef& c,
+		      const ghobject_t& oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r;
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, true);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  o->exists = false;
+  for (map<uint64_t,fragment_t>::iterator p = o->onode.data_map.begin();
+       p != o->onode.data_map.end();
+       ++p) {
+    txc->remove_fid(p->second.fid);
+  }
+  o->onode.data_map.clear();
+  o->onode.size = 0;
+  txc->write_onode(o);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_setattr(TransContextRef& txc,
+		       CollectionRef& c,
+		       const ghobject_t& oid,
+		       const string& name,
+		       bufferptr& val)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << name << " (" << val.length() << " bytes)"
+	   << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  o->onode.attrs[name] = val;
+  txc->write_onode(o);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << name << " (" << val.length() << " bytes)"
+	   << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_setattrs(TransContextRef& txc,
+			CollectionRef& c,
+			const ghobject_t& oid,
+			const map<string,bufferptr>& aset)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << aset.size() << " keys"
+	   << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  for (map<string,bufferptr>::const_iterator p = aset.begin();
+       p != aset.end(); ++p)
+    o->onode.attrs[p->first] = p->second;
+  txc->write_onode(o);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << aset.size() << " keys"
+	   << " = " << r << dendl;
+  return r;
+}
+
+
+int NewStore::_rmattr(TransContextRef& txc,
+		      CollectionRef& c,
+		      const ghobject_t& oid,
+		      const string& name)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << name << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  o->onode.attrs.erase(name);
+  txc->write_onode(o);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " " << name << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_rmattrs(TransContextRef& txc,
+		       CollectionRef& c,
+		       const ghobject_t& oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  o->onode.attrs.clear();
+  txc->write_onode(o);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_clone(TransContextRef& txc,
+		     CollectionRef& c,
+		     const ghobject_t& old_oid,
+		     const ghobject_t& new_oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << old_oid << " -> "
+	   << new_oid << dendl;
+  int r = 0;
+
+  assert(0 == "writ eme");
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << old_oid << " -> "
+	   << new_oid << " = " << r << dendl;
+  return r;
+}
+
+
+// collections
+
+int NewStore::_create_collection(
+  TransContextRef& txc,
+  coll_t cid,
+  CollectionRef *c)
+{
+  dout(15) << __func__ << " " << cid << dendl;
+  int r;
+  bufferlist empty;
+
+  {
+    RWLock::WLocker l(coll_lock);
+    if (*c) {
+      r = -EEXIST;
+      goto out;
+    }
+    c->reset(new Collection(this, cid));
+    coll_map[cid] = *c;
+  }
+  txc->t->set(PREFIX_COLL, stringify(cid), empty);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << cid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
+				 CollectionRef *c)
+{
+  dout(15) << __func__ << " " << cid << dendl;
+  int r;
+  bufferlist empty;
+
+  {
+    RWLock::WLocker l(coll_lock);
+    if (!*c) {
+      r = -ENOENT;
+      goto out;
+    }
+    if (!(*c)->onode_map.empty()) {  // XXX
+      r = -ENOTEMPTY;
+      goto out;
+    }
+    coll_map.erase(cid);
+    c->reset();
+  }
+  txc->t->rmkey(PREFIX_COLL, stringify(cid));
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << cid << " = " << r << dendl;
+  return r;
+}
+
+
+
 
 
 // ===========================================

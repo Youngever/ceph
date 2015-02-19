@@ -48,6 +48,8 @@ public:
   };
   typedef ceph::shared_ptr<FragmentHandle> FragmentHandleRef;
 
+  class TransContext;
+
   /// an in-memory object
   struct Onode {
     ghobject_t oid;
@@ -55,6 +57,10 @@ public:
     onode_t onode;  ///< metadata stored as value in kv store
     bool dirty;     // ???
     bool exists;
+
+    //list<TransContextRef> uncommitted_txns; ///< pending txns
+    list<TransContext*> unapplied_txns;   ///< committed but unapplied txns
+    Cond wal_cond;   ///< wait here for unapplied txns
 
     Onode(const ghobject_t& o, const string& k);
   };
@@ -133,6 +139,12 @@ public:
 
     wal_transaction_t *wal_txn; ///< wal transaction (if any)
 
+    TransContext()
+      : wal_txn(NULL) {}
+    ~TransContext() {
+      delete wal_txn;
+    }
+
     void sync_fd(int f) {
       fds.push_back(f);
     }
@@ -141,6 +153,20 @@ public:
     }
     void remove_fid(fid_t f) {
       remove.push_back(f);
+    }
+
+    void start_wal_apply() {
+      for (list<OnodeRef>::iterator p = onodes.begin(); p != onodes.end(); ++p) {
+	(*p)->unapplied_txns.push_back(this);
+      }
+    }
+    void finish_wal_apply() {
+      for (list<OnodeRef>::iterator p = onodes.begin(); p != onodes.end(); ++p) {
+	assert((*p)->unapplied_txns.front() == this);
+	(*p)->unapplied_txns.pop_front();
+	if ((*p)->unapplied_txns.empty())
+	  (*p)->wal_cond.Signal();
+      }
     }
   };
   typedef ceph::shared_ptr<TransContext> TransContextRef;
@@ -196,6 +222,9 @@ private:
   Mutex fid_lock;
   fid_t cur_fid;
 
+  Mutex wal_lock;
+  atomic64_t wal_seq;
+
   Finisher finisher;
   Logger *logger;
 
@@ -224,8 +253,13 @@ private:
   CollectionRef _get_collection(coll_t cid);
 
   int _open_next_fid(fid_t *fid);
+  int _open_fid(fid_t fid);
+  int _remove_fid(fid_t fid);
   TransContext *_create_txc(OpSequencer *osr);
   int _finalize_txc(OpSequencer *osr, TransContextRef& txc);
+  wal_op_t *_get_wal_op(TransContextRef& txc);
+  int _apply_wal_transaction(TransContextRef& txc);
+  friend class C_ApplyWAL;
 
 public:
   NewStore(CephContext *cct, const string& path);

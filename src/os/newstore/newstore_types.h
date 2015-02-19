@@ -25,16 +25,19 @@ namespace ceph {
 /// unique id for a local file
 struct fid_t {
   uint32_t fset, fno;
-  fid_t() : fset(0), fno(0) {}
-  fid_t(uint32_t s, uint32_t n) : fset(s), fno(n) {}
+  uint64_t ino;       ///< [optional] ino for lookup-by-ino
+  fid_t() : fset(0), fno(0), ino(0) {}
+  fid_t(uint32_t s, uint32_t n) : fset(s), fno(n), ino(0) {}
 
   void encode(bufferlist& bl) const {
     ::encode(fset, bl);
     ::encode(fno, bl);
+    ::encode(ino, bl);
   }
   void decode(bufferlist::iterator& p) {
     ::decode(fset, p);
     ::decode(fno, p);
+    ::decode(ino, p);
   }
   void dump(Formatter *f) const;
   static void generate_test_instances(list<fid_t*>& o);
@@ -42,7 +45,10 @@ struct fid_t {
 WRITE_CLASS_ENCODER(fid_t)
 
 static inline ostream& operator<<(ostream& out, const fid_t& fid) {
-  return out << fid.fset << "/" << fid.fno;
+  out << fid.fset << "/" << fid.fno;
+  if (fid.ino)
+    out << "@" << fid.ino;
+  return out;
 }
 
 /// fragment: a byte extent backed by a file
@@ -90,7 +96,7 @@ struct wal_op_t {
   __u8 op;
   fid_t fid;
   uint64_t offset, length;
-  bufferlist bl;
+  bufferlist data;
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& p);
