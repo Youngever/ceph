@@ -77,11 +77,7 @@ public:
 
     OnodeRef get_onode(const ghobject_t& oid, bool create);
 
-    Collection(NewStore *ns, coll_t c)
-      : store(ns),
-	cid(c),
-	lock("NewStore::Collection::lock")
-    {}
+    Collection(NewStore *ns, coll_t c);
   };
   typedef ceph::shared_ptr<Collection> CollectionRef;
 
@@ -208,6 +204,7 @@ public:
   // --------------------------------------------------------
   // members
 private:
+  CephContext *cct;
   KeyValueDB *db;
   uuid_d fsid;
   int path_fd;  ///< open handle to $path
@@ -252,7 +249,7 @@ private:
 
   CollectionRef _get_collection(coll_t cid);
 
-  int _open_next_fid(fid_t *fid);
+  int _create_fid(fid_t *fid);
   int _open_fid(fid_t fid);
   int _remove_fid(fid_t fid);
   TransContext *_create_txc(OpSequencer *osr);
@@ -435,7 +432,8 @@ private:
 	     const ghobject_t& new_oid);
   int _create_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
   int _remove_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
-
+  void _finish_remove_collection(CollectionRef c);
+  friend class C_FinishRemoveCollection;
 
 };
 

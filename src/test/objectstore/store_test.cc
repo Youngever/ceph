@@ -233,8 +233,35 @@ TEST_P(StoreTest, SimpleObjectTest) {
     bufferlist bl;
     bl.append("abcde");
     t.remove(cid, hoid);
-    t.write(cid, hoid, 10, 5, bl);
+    t.write(cid, hoid, 0, 5, bl);
     cerr << "Remove then create" << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  {
+    ObjectStore::Transaction t;
+    bufferlist bl;
+    bl.append("abcde");
+    t.write(cid, hoid, 5, 5, bl);
+    cerr << "Append" << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  {
+    ObjectStore::Transaction t;
+    bufferlist bl;
+    bl.append("abcdeabcde");
+    t.write(cid, hoid, 0, 10, bl);
+    cerr << "Full overwrite" << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  {
+    ObjectStore::Transaction t;
+    bufferlist bl;
+    bl.append("abcde");
+    t.write(cid, hoid, 3, 5, bl);
+    cerr << "Partial overwrite" << std::endl;
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
   }

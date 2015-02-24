@@ -122,6 +122,14 @@ static void get_object_key(const ghobject_t& oid, string *key)
 #undef dout_prefix
 #define dout_prefix *_dout << "newstore(" << store->path << ").collection(" << cid << ") "
 
+NewStore::Collection::Collection(NewStore *ns, coll_t c)
+  : store(ns),
+    cid(c),
+    lock("NewStore::Collection::lock"),
+    onode_map(store->cct, store->cct->_conf->newstore_onode_map_size)
+{
+}
+
 NewStore::OnodeRef NewStore::Collection::get_onode(
   const ghobject_t& oid,
   bool create)
@@ -169,6 +177,7 @@ NewStore::OnodeRef NewStore::Collection::get_onode(
 
 NewStore::NewStore(CephContext *cct, const string& path)
   : ObjectStore(path),
+    cct(cct),
     db(NULL),
     path_fd(-1),
     fsid_fd(-1),
@@ -727,14 +736,17 @@ int NewStore::_open_fid(fid_t fid)
   int fd = ::openat(frag_fd, fn, O_RDWR);
   if (fd < 0)
     return -errno;
+  dout(30) << __func__ << " " << fid << " = " << fd << dendl;
   return fd;
 }
 
-int NewStore::_open_next_fid(fid_t *fid)
+int NewStore::_create_fid(fid_t *fid)
 {
   {
     Mutex::Locker l(fid_lock);
-    if (cur_fid.fno < g_conf->newstore_max_dir_size) {
+    if (cur_fid.fset > 0 &&
+	cur_fid.fno > 0 &&
+	cur_fid.fno < g_conf->newstore_max_dir_size) {
       ++cur_fid.fno;
     } else {
       ++cur_fid.fset;
@@ -781,6 +793,8 @@ int NewStore::_open_next_fid(fid_t *fid)
     return r;
   }
   fid->ino = st.st_ino;
+  dout(30) << __func__ << " " << *fid << " = " << fd
+	   << " ino " << fid->ino << dendl;
   return fd;
 }
 
@@ -852,7 +866,12 @@ int NewStore::_apply_wal_transaction(TransContextRef& txc)
 	if (fd < 0)
 	  return fd;
 	int r = ::lseek64(fd, p->offset, SEEK_SET);
-	assert(r == 0);
+	if (r < 0) {
+	  r = -errno;
+	  derr << __func__ << " lseek64 on " << fd << " got: "
+	       << cpp_strerror(r) << dendl;
+	  return r;
+	}
 	p->data.write_fd(fd);
 	sync_fds.push_back(fd);
       }
@@ -865,7 +884,12 @@ int NewStore::_apply_wal_transaction(TransContextRef& txc)
 	if (fd < 0)
 	  return fd;
 	int r = ::ftruncate(fd, p->offset);
-	assert(r == 0);
+	if (r < 0) {
+	  r = -errno;
+	  derr << __func__ << " truncate on " << fd << " got: "
+	       << cpp_strerror(r) << dendl;
+	  return r;
+	}
 	//sync_fds.push_back(fd);  // do we care?
       }
       break;
@@ -950,6 +974,7 @@ int NewStore::queue_transactions(
 
   /// XXX fixme: use aio fsync
   for (list<int>::iterator p = txc->fds.begin(); p != txc->fds.end(); ++p) {
+    dout(30) << __func__ << " fsync " << *p << dendl;
     int r = ::fsync(*p);
     if (r < 0) {
       r = -errno;
@@ -1342,7 +1367,7 @@ int NewStore::_write(TransContextRef& txc,
       fragment_t &f = o->onode.data_map[0];
       f.offset = 0;
       f.length = length;
-      fd = _open_next_fid(&f.fid);
+      fd = _create_fid(&f.fid);
       if (fd < 0) {
 	r = fd;
 	goto out;
@@ -1361,6 +1386,8 @@ int NewStore::_write(TransContextRef& txc,
       ::lseek64(fd, offset, SEEK_SET);
     }
     o->onode.size = offset + length;
+    r = bl.write_fd(fd);
+    txc->sync_fd(fd);
   } else {
     // WAL
     assert(o->onode.data_map.size() == 1);
@@ -1376,8 +1403,6 @@ int NewStore::_write(TransContextRef& txc,
       o->onode.size;
   }
 
-  r = bl.write_fd(fd);
-  txc->sync_fd(fd);
   txc->write_onode(o);
 
  out:
@@ -1625,6 +1650,15 @@ int NewStore::_create_collection(
   return r;
 }
 
+struct C_FinishRemoveCollection : public Context {
+  NewStore *store;
+  NewStore::CollectionRef c;
+  C_FinishRemoveCollection(NewStore *s, NewStore::CollectionRef c) : store(s), c(c) {}
+  void finish(int r) {
+    store->_finish_remove_collection(c);
+  }
+};
+
 int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
 				 CollectionRef *c)
 {
@@ -1638,11 +1672,16 @@ int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
       r = -ENOENT;
       goto out;
     }
-    if (!(*c)->onode_map.empty()) {  // XXX
-      r = -ENOTEMPTY;
-      goto out;
+    pair<ghobject_t,OnodeRef> next;
+    while ((*c)->onode_map.get_next(next.first, &next)) {
+      if (next.second->exists) {
+	r = -ENOTEMPTY;
+	goto out;
+      }
     }
     coll_map.erase(cid);
+
+    finisher.queue(new C_FinishRemoveCollection(this, *c));
     c->reset();
   }
   txc->t->rmkey(PREFIX_COLL, stringify(cid));
@@ -1653,6 +1692,17 @@ int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
   return r;
 }
 
+void NewStore::_finish_remove_collection(CollectionRef c)
+{
+  dout(10) << __func__ << " " << c->cid << dendl;
+  pair<ghobject_t,OnodeRef> next;
+  while (c->onode_map.get_next(next.first, &next)) {
+    assert(!next.second->exists);
+    assert(next.second->unapplied_txns.empty());
+  }
+  c->onode_map.clear();
+  c->onode_map.dump_weak_refs();
+}
 
 
 
