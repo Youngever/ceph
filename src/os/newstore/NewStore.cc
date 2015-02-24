@@ -30,25 +30,37 @@ const string PREFIX_OBJ = "O";  // object name -> onode
 const string PREFIX_WAL = "L";  // write ahead log
 
 
-const char KEY_SEP_C = '!';
+/*
+ * key
+ *
+ * The key string needs to lexicographically sort the same way that
+ * ghobject_t does.  We do this by escaping anything <= to '%' or >
+ * 126 with % plus the 2 digit hex string.
+ *
+ * We use ! as a separator for strings; this works because it is < %
+ * and will get escaped if it is present in the string.
+ *
+ * For the fixed length numeric fields, we just use hex and '.' as a
+ * convenient visual separator.  Two oddities here:
+ *
+ *   1. for the -1 shard value we use --; it's the only negative value
+ *      and it sorts < 0 that way.
+ *
+ *   2. for the pool value, we add 2^63 so that it sorts correctly
+ *
+ * We could do something much more compact here, but it would be less
+ * readable by humans.  :/
+ */
+
 const string KEY_SEP_S = "!";
-const char KEY_END = 0xff;
 
 static void append_escaped(const string &in, string *out)
 {
+  char hexbyte[8];
   for (string::const_iterator i = in.begin(); i != in.end(); ++i) {
-    if (*i == '%') {
-      out->push_back('%');
-      out->push_back('p');
-    } else if (*i == '.') {
-      out->push_back('%');
-      out->push_back('e');
-    } else if (*i == KEY_SEP_C) {
-      out->push_back('%');
-      out->push_back('u');
-    } else if (*i == '!') {
-      out->push_back('%');
-      out->push_back('s');
+    if (*i <= '%' || *i > 126) {
+      snprintf(hexbyte, sizeof(hexbyte), "%%%02x", (unsigned)*i);
+      out->append(hexbyte);
     } else {
       out->push_back(*i);
     }
@@ -61,24 +73,25 @@ static void get_object_key(const ghobject_t& oid, string *key)
   char *t = buf;
   char *end = t + sizeof(buf);
 
-  // make field ordering match with ghobject_t compare operations
+  key->clear();
 
-  t = buf;
-  t += snprintf(t, end - t, "%2X%c%.*X%c",
-		(int)oid.shard_id,  // XXX
-		KEY_SEP_C,
+  // make field ordering match with ghobject_t compare operations
+  if (oid.shard_id == shard_id_t::NO_SHARD) {
+    // otherwise ff will sort *after* 0, not before.
+    *key = "--";
+  } else {
+    snprintf(buf, sizeof(buf), "%02x", (int)oid.shard_id);
+    key->append(buf);
+  }
+
+  t += snprintf(t, end - t, ".%016llx.%.*X.",
+		(long long)(oid.hobj.pool + 0x8000000000000000),
 		(int)(sizeof(oid.hobj.get_hash())*2),
-		(uint32_t)oid.get_filestore_key_u32(),
-		KEY_SEP_C);
-  *key += string(buf);
+		(uint32_t)oid.get_filestore_key_u32());
+  key->append(buf);
 
   append_escaped(oid.hobj.nspace, key);
   key->append(KEY_SEP_S);
-
-  t = buf;
-  t += snprintf(t, end - t, "%lld%c", (long long)oid.hobj.pool,
-		KEY_SEP_C);
-  *key += string(buf);
 
   append_escaped(oid.hobj.get_key(), key);
   key->append(KEY_SEP_S);
@@ -87,33 +100,10 @@ static void get_object_key(const ghobject_t& oid, string *key)
   key->append(KEY_SEP_S);
 
   t = buf;
-  if (oid.hobj.snap == CEPH_NOSNAP)
-    t += snprintf(t, end - t, "head");
-  else if (oid.hobj.snap == CEPH_SNAPDIR)
-    t += snprintf(t, end - t, "snapdir");
-  else
-    // Keep length align
-    t += snprintf(t, end - t, "%016llx", (long long unsigned)oid.hobj.snap);
-  *key += string(buf);
-
-  if (oid.generation != ghobject_t::NO_GEN) {
-    assert(oid.shard_id != shard_id_t::NO_SHARD);
-    key->append(KEY_SEP_S);
-
-    t = buf;
-    end = t + sizeof(buf);
-    t += snprintf(t, end - t, "%016llx", (long long unsigned)oid.generation);
-    *key += string(buf);
-
-    key->append(KEY_SEP_S);
-
-    t = buf;
-    end = t + sizeof(buf);
-    t += snprintf(t, end - t, "%x", (int)oid.shard_id);
-    *key += string(buf);
-  }
-
-  key->append(1, KEY_END);
+  t += snprintf(t, end - t, "%016llx.%016llx",
+		(long long unsigned)oid.hobj.snap,
+		(long long unsigned)oid.generation);
+  key->append(buf);
 }
 
 // =======================================================
