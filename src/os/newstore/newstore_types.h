@@ -47,8 +47,15 @@ WRITE_CLASS_ENCODER(fid_t)
 static inline ostream& operator<<(ostream& out, const fid_t& fid) {
   out << fid.fset << "/" << fid.fno;
   if (fid.ino)
-    out << "@" << fid.ino;
+    out << ":" << fid.ino;
   return out;
+}
+
+static inline bool operator==(const fid_t& a, const fid_t& b) {
+  return a.fset == b.fset && a.fno == b.fno && a.ino == b.ino;
+}
+static inline bool operator!=(const fid_t& a, const fid_t& b) {
+  return !(a == b);
 }
 
 /// fragment: a byte extent backed by a file

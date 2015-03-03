@@ -214,11 +214,17 @@ TEST_P(StoreTest, SimpleObjectTest) {
   }
   ghobject_t hoid(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
   {
+    bool exists = store->exists(cid, hoid);
+    ASSERT_EQ(false, exists);
+
     ObjectStore::Transaction t;
     t.touch(cid, hoid);
     cerr << "Creating object " << hoid << std::endl;
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
+
+    exists = store->exists(cid, hoid);
+    ASSERT_EQ(true, exists);
   }
   {
     ObjectStore::Transaction t;
@@ -230,31 +236,50 @@ TEST_P(StoreTest, SimpleObjectTest) {
   }
   {
     ObjectStore::Transaction t;
-    bufferlist bl;
+    bufferlist bl, orig;
     bl.append("abcde");
+    orig = bl;
     t.remove(cid, hoid);
     t.write(cid, hoid, 0, 5, bl);
     cerr << "Remove then create" << std::endl;
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
+
+    bufferlist in;
+    r = store->read(cid, hoid, 0, 5, in);
+    ASSERT_EQ(5, r);
+    ASSERT_TRUE(in.contents_equal(orig));
   }
   {
     ObjectStore::Transaction t;
-    bufferlist bl;
+    bufferlist bl, exp;
     bl.append("abcde");
+    exp = bl;
+    exp.append(bl);
     t.write(cid, hoid, 5, 5, bl);
     cerr << "Append" << std::endl;
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
+
+    bufferlist in;
+    r = store->read(cid, hoid, 0, 10, in);
+    ASSERT_EQ(10, r);
+    ASSERT_TRUE(in.contents_equal(exp));
   }
   {
     ObjectStore::Transaction t;
-    bufferlist bl;
+    bufferlist bl, exp;
     bl.append("abcdeabcde");
+    exp = bl;
     t.write(cid, hoid, 0, 10, bl);
     cerr << "Full overwrite" << std::endl;
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
+
+    bufferlist in;
+    r = store->read(cid, hoid, 0, 10, in);
+    ASSERT_EQ(10, r);
+    ASSERT_TRUE(in.contents_equal(exp));
   }
   {
     ObjectStore::Transaction t;
@@ -264,6 +289,12 @@ TEST_P(StoreTest, SimpleObjectTest) {
     cerr << "Partial overwrite" << std::endl;
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
+
+    bufferlist in, exp;
+    exp.append("abcabcdede");
+    r = store->read(cid, hoid, 0, 10, in);
+    ASSERT_EQ(10, r);
+    ASSERT_TRUE(in.contents_equal(exp));
   }
   {
     ObjectStore::Transaction t;

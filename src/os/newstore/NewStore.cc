@@ -553,8 +553,8 @@ bool NewStore::exists(coll_t cid, const ghobject_t& oid)
   RWLock::RLocker l(c->lock);
   OnodeRef o = c->get_onode(oid, false);
   if (!o || !o->exists)
-    return -ENOENT;
-  return 0;
+    return false;
+  return true;
 }
 
 int NewStore::stat(
@@ -582,12 +582,110 @@ int NewStore::read(
   coll_t cid,
   const ghobject_t& oid,
   uint64_t offset,
-  size_t len,
+  size_t length,
   bufferlist& bl,
   uint32_t op_flags,
   bool allow_eio)
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid << " " << oid
+	   << " " << offset << "~" << length
+	   << dendl;
+  bl.clear();
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return false;
+  RWLock::RLocker l(c->lock);
+
+  int r;
+  int fd = -1;
+  fid_t cur_fid;
+  map<uint64_t,fragment_t>::iterator p;
+
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+
+  if (offset > o->onode.size) {
+    r = 0;
+    goto out;
+  }
+
+  if (offset + length > o->onode.size) {
+    length = o->onode.size - offset;
+  }
+
+  r = 0;
+  for (p = o->onode.data_map.lower_bound(offset);
+       length > 0 && p != o->onode.data_map.end();
+       ++p) {
+    if (p->first + p->second.length <= offset) {
+      dout(30) << __func__ << " skipping " << p->first << "~" << p->second.length
+	       << dendl;
+      continue;
+    }
+    if (p->first > offset) {
+      unsigned l = p->first - offset;
+      dout(30) << __func__ << " zero " << offset << "~" << l << dendl;
+      bufferptr bp(l);
+      bp.zero();
+      bl.append(bp);
+    }
+    if (p->second.fid != cur_fid) {
+      cur_fid = p->second.fid;
+      if (fd >= 0) {
+	VOID_TEMP_FAILURE_RETRY(::close(fd));
+      }
+      fd = _open_fid(cur_fid);
+      if (fd < 0) {
+	r = fd;
+	goto out;
+      }
+    }
+    unsigned x_off;
+    if (p->first < offset) {
+      x_off = offset - p->first;
+    } else {
+      x_off = 0;
+    }
+    unsigned x_len = MIN(length, p->second.length);
+    dout(30) << __func__ << " data " << offset << "~" << x_len
+	     << " fid " << cur_fid << " offset " << x_off + p->second.offset
+	     << dendl;
+    r = ::lseek64(fd, p->second.offset + x_off, SEEK_SET);
+    if (r < 0) {
+      r = -errno;
+      goto out;
+    }
+    bufferlist t;
+    r = t.read_fd(fd, x_len);
+    if (r < 0) {
+      goto out;
+    }
+    if ((unsigned)r < x_len) {
+      derr << __func__ << "   short read " << r << " from " << cur_fid
+	   << " offset " << p->second.offset + x_off << dendl;
+      r = -EIO;
+      goto out;
+    }
+    bl.claim_append(t);
+    offset += x_len;
+    length -= x_len;
+  }
+  if (length > 0 && p == o->onode.data_map.end()) {
+    dout(30) << __func__ << " trailing zero " << offset << "~" << length << dendl;
+    bufferptr bp(length);
+    bp.zero();
+    bl.push_back(bp);
+  }
+  r = bl.length();
+
+ out:
+  dout(10) << __func__ << " " << cid << " " << oid
+	   << " " << offset << "~" << length
+	   << " = " << r << dendl;
+  return r;
 }
 
 int NewStore::fiemap(
@@ -1350,6 +1448,8 @@ int NewStore::_write(TransContextRef& txc,
   RWLock::WLocker l(c->lock);
   OnodeRef o = c->get_onode(oid, true);
   int fd;
+
+  o->exists = true;
 
   if (o->onode.size == offset) {
     if (o->onode.data_map.empty()) {
