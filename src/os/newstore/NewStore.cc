@@ -781,6 +781,7 @@ bool NewStore::collection_empty(coll_t cid)
   CollectionRef c = _get_collection(cid);
   if (!c)
     return -ENOENT;
+  RWLock::RLocker l(c->lock);
 
   bool r = true;
   pair<ghobject_t,OnodeRef> next;
@@ -791,28 +792,90 @@ bool NewStore::collection_empty(coll_t cid)
     }
   }
 
-  dout(15) << __func__ << " " << cid << " = " << (int)r << dendl;
+  dout(10) << __func__ << " " << cid << " = " << (int)r << dendl;
   return r;
 }
 
 int NewStore::collection_list(coll_t cid, vector<ghobject_t>& o)
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  RWLock::RLocker l(c->lock);
+  int r = 0;
+  pair<ghobject_t,OnodeRef> next;
+  while (c->onode_map.get_next(next.first, &next)) {
+    if (next.second->exists) {
+      o.push_back(next.first);
+    }
+  }
+  dout(10) << __func__ << " " << cid << " = " << r << dendl;
+  return r;
 }
 
 int NewStore::collection_list_partial(
   coll_t cid, ghobject_t start,
   int min, int max, snapid_t snap,
-  vector<ghobject_t> *ls, ghobject_t *next)
+  vector<ghobject_t> *ls, ghobject_t *pnext)
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid
+	   << " start " << start << " min/max " << min << "/" << max
+	   << " snap " << snap << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  RWLock::RLocker l(c->lock);
+  int r = 0;
+  pair<ghobject_t,OnodeRef> next;
+  next.first = start;
+  while (true) {
+    if (!c->onode_map.get_next(next.first, &next)) {
+      *pnext = ghobject_t::get_max();
+      break;
+    }
+    if (next.second->exists) {
+      ls->push_back(next.first);
+      if (ls->size() >= (unsigned)max) {
+	*pnext = next.first;
+	break;
+      }
+    }
+  }
+  dout(10) << __func__ << " " << cid
+	   << " start " << start << " min/max " << min << "/" << max
+	   << " snap " << snap << " = " << r << dendl;
+  return r;
 }
 
 int NewStore::collection_list_range(
   coll_t cid, ghobject_t start, ghobject_t end,
   snapid_t seq, vector<ghobject_t> *ls)
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid
+	   << " start " << start << " end " << end
+	   << " snap " << seq << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  RWLock::RLocker l(c->lock);
+  int r = 0;
+  pair<ghobject_t,OnodeRef> next;
+  next.first = start;
+  while (true) {
+    if (!c->onode_map.get_next(next.first, &next)) {
+      break;
+    }
+    if (next.second->exists) {
+      if (next.first >= end)
+	break;
+      ls->push_back(next.first);
+    }
+  }
+  dout(10) << __func__ << " " << cid
+	   << " start " << start << " end " << end
+	   << " snap " << seq << " = " << r << dendl;
+  return r;
 }
 
 int NewStore::omap_get(
