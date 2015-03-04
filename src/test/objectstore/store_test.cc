@@ -215,7 +215,7 @@ TEST_P(StoreTest, SimpleObjectTest) {
   ghobject_t hoid(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
   {
     bool exists = store->exists(cid, hoid);
-    ASSERT_EQ(false, exists);
+    ASSERT_TRUE(!exists);
 
     ObjectStore::Transaction t;
     t.touch(cid, hoid);

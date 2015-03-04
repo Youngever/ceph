@@ -60,9 +60,16 @@ public:
 
     //list<TransContextRef> uncommitted_txns; ///< pending txns
     list<TransContext*> unapplied_txns;   ///< committed but unapplied txns
+    Mutex wal_lock;  ///< protect unappliex_txns
     Cond wal_cond;   ///< wait here for unapplied txns
 
     Onode(const ghobject_t& o, const string& k);
+
+    void wait_wal() {
+      Mutex::Locker l(wal_lock);
+      while (!unapplied_txns.empty())
+	wal_cond.Wait(wal_lock);
+    }
   };
   typedef ceph::shared_ptr<Onode> OnodeRef;
 
@@ -130,8 +137,8 @@ public:
     list<int> fds;             ///< these fds need to be synced
     list<OnodeRef> onodes;     ///< these onodes need to be updated/written
     KeyValueDB::Transaction t; ///< then we will commit this
-    list<fid_t> remove;        ///< later, these fids need to be removed
     list<Context*> oncommit;   ///< signal on commit
+    list<CollectionRef> removed_collections; ///< colls we removed
 
     wal_transaction_t *wal_txn; ///< wal transaction (if any)
 
@@ -147,17 +154,16 @@ public:
     void write_onode(OnodeRef &o) {
       onodes.push_back(o);
     }
-    void remove_fid(fid_t f) {
-      remove.push_back(f);
-    }
 
     void start_wal_apply() {
       for (list<OnodeRef>::iterator p = onodes.begin(); p != onodes.end(); ++p) {
+	Mutex::Locker l((*p)->wal_lock);
 	(*p)->unapplied_txns.push_back(this);
       }
     }
     void finish_wal_apply() {
       for (list<OnodeRef>::iterator p = onodes.begin(); p != onodes.end(); ++p) {
+	Mutex::Locker l((*p)->wal_lock);
 	assert((*p)->unapplied_txns.front() == this);
 	(*p)->unapplied_txns.pop_front();
 	if ((*p)->unapplied_txns.empty())
@@ -256,6 +262,7 @@ private:
   int _finalize_txc(OpSequencer *osr, TransContextRef& txc);
   wal_op_t *_get_wal_op(TransContextRef& txc);
   int _apply_wal_transaction(TransContextRef& txc);
+  void _wait_object_wal(OnodeRef onode);
   friend class C_ApplyWAL;
 
 public:
@@ -432,8 +439,8 @@ private:
 	     const ghobject_t& new_oid);
   int _create_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
   int _remove_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
-  void _finish_remove_collection(CollectionRef c);
-  friend class C_FinishRemoveCollection;
+  void _finish_remove_collections(TransContextRef& txc);
+  friend class C_FinishRemoveCollections;
 
 };
 

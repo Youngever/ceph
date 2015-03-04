@@ -499,6 +499,7 @@ int NewStore::umount()
 {
   assert(mounted);
   dout(1) << __func__ << dendl;
+  finisher.wait_for_empty();
   mounted = false;
   if (fset_fd >= 0)
     VOID_TEMP_FAILURE_RETRY(::close(fset_fd));
@@ -536,7 +537,8 @@ NewStore::Onode::Onode(const ghobject_t& o, const string& k)
   : oid(o),
     key(k),
     dirty(false),
-    exists(true) {
+    exists(true),
+    wal_lock("NewStore::Onode::wal_lock") {
 }
 
 
@@ -615,6 +617,8 @@ int NewStore::read(
   if (offset + length > o->onode.size) {
     length = o->onode.size - offset;
   }
+
+  o->wait_wal();
 
   r = 0;
   for (p = o->onode.data_map.lower_bound(offset);
@@ -1016,6 +1020,16 @@ struct C_ApplyWAL : public Context {
 // ---------------------------
 // transactions
 
+struct C_FinishRemoveCollections : public Context {
+  NewStore *store;
+  NewStore::TransContextRef txc;
+  C_FinishRemoveCollections(NewStore *s, NewStore::TransContextRef t)
+    : store(s), txc(t) {}
+  void finish(int r) {
+    store->_finish_remove_collections(txc);
+  }
+};
+
 int NewStore::queue_transactions(
     Sequencer *posr,
     list<Transaction*>& tls,
@@ -1078,8 +1092,15 @@ int NewStore::queue_transactions(
     finisher.queue(ondisk);
 
   if (txc->wal_txn) {
+    dout(20) << __func__ << " starting wal apply" << dendl;
     txc->start_wal_apply();
     finisher.queue(new C_ApplyWAL(this, txc));
+  } else {
+    dout(20) << __func__ << " no wal" << dendl;
+  }
+
+  if (!txc->removed_collections.empty()) {
+    finisher.queue(new C_FinishRemoveCollections(this, txc));
   }
 
   return 0;
@@ -1538,7 +1559,9 @@ int NewStore::_truncate(TransContextRef& txc,
   }
   if (offset == 0) {
     while (!o->onode.data_map.empty()) {
-      txc->remove_fid(o->onode.data_map.rbegin()->second.fid);
+      wal_op_t *op = _get_wal_op(txc);
+      op->op = wal_op_t::OP_REMOVE;
+      op->fid = o->onode.data_map.rbegin()->second.fid;
       o->onode.data_map.erase(o->onode.data_map.rbegin()->first);
     }
   } else if (offset < o->onode.size) {
@@ -1568,20 +1591,28 @@ int NewStore::_remove(TransContextRef& txc,
   dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
   int r;
   RWLock::WLocker l(c->lock);
+  string key;
   OnodeRef o = c->get_onode(oid, true);
   if (!o || !o->exists) {
     r = -ENOENT;
     goto out;
   }
   o->exists = false;
-  for (map<uint64_t,fragment_t>::iterator p = o->onode.data_map.begin();
-       p != o->onode.data_map.end();
-       ++p) {
-    txc->remove_fid(p->second.fid);
+  if (!o->onode.data_map.empty()) {
+    for (map<uint64_t,fragment_t>::iterator p = o->onode.data_map.begin();
+	 p != o->onode.data_map.end();
+	 ++p) {
+      wal_op_t *op = _get_wal_op(txc);
+      op->op = wal_op_t::OP_REMOVE;
+      op->fid = p->second.fid;
+    }
   }
   o->onode.data_map.clear();
   o->onode.size = 0;
-  txc->write_onode(o);
+
+  get_object_key(oid, &key);
+  txc->t->rmkey(PREFIX_OBJ, key);
+
   r = 0;
 
  out:
@@ -1740,15 +1771,6 @@ int NewStore::_create_collection(
   return r;
 }
 
-struct C_FinishRemoveCollection : public Context {
-  NewStore *store;
-  NewStore::CollectionRef c;
-  C_FinishRemoveCollection(NewStore *s, NewStore::CollectionRef c) : store(s), c(c) {}
-  void finish(int r) {
-    store->_finish_remove_collection(c);
-  }
-};
-
 int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
 				 CollectionRef *c)
 {
@@ -1770,8 +1792,7 @@ int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
       }
     }
     coll_map.erase(cid);
-
-    finisher.queue(new C_FinishRemoveCollection(this, *c));
+    txc->removed_collections.push_back(*c);
     c->reset();
   }
   txc->t->rmkey(PREFIX_COLL, stringify(cid));
@@ -1782,16 +1803,24 @@ int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
   return r;
 }
 
-void NewStore::_finish_remove_collection(CollectionRef c)
+void NewStore::_finish_remove_collections(TransContextRef& txc)
 {
-  dout(10) << __func__ << " " << c->cid << dendl;
-  pair<ghobject_t,OnodeRef> next;
-  while (c->onode_map.get_next(next.first, &next)) {
-    assert(!next.second->exists);
-    assert(next.second->unapplied_txns.empty());
+  // clear out *my* lingering Onode refs
+  txc->onodes.clear();
+
+  for (list<CollectionRef>::iterator p = txc->removed_collections.begin();
+       p != txc->removed_collections.end();
+       ++p) {
+    CollectionRef c = *p;
+    dout(10) << __func__ << " " << c->cid << dendl;
+    pair<ghobject_t,OnodeRef> next;
+    while (c->onode_map.get_next(next.first, &next)) {
+      assert(!next.second->exists);
+      assert(next.second->unapplied_txns.empty());
+    }
+    c->onode_map.clear();
+    c->onode_map.dump_weak_refs();
   }
-  c->onode_map.clear();
-  c->onode_map.dump_weak_refs();
 }
 
 
