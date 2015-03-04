@@ -775,9 +775,24 @@ bool NewStore::collection_exists(coll_t c)
   return coll_map.count(c);
 }
 
-bool NewStore::collection_empty(coll_t c)
+bool NewStore::collection_empty(coll_t cid)
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+
+  bool r = true;
+  pair<ghobject_t,OnodeRef> next;
+  while (c->onode_map.get_next(next.first, &next)) {
+    if (next.second->exists) {
+      r = false;
+      break;
+    }
+  }
+
+  dout(15) << __func__ << " " << cid << " = " << (int)r << dendl;
+  return r;
 }
 
 int NewStore::collection_list(coll_t cid, vector<ghobject_t>& o)

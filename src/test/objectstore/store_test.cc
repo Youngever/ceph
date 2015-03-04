@@ -328,6 +328,10 @@ TEST_P(StoreTest, SimpleAttrTest) {
     ASSERT_EQ(r, 0);
   }
   {
+    bool r = store->collection_empty(cid);
+    ASSERT_TRUE(r);
+  }
+  {
     bufferptr bp;
     r = store->getattr(cid, hoid, "nofoo", bp);
     ASSERT_EQ(-ENOENT, r);
@@ -339,6 +343,10 @@ TEST_P(StoreTest, SimpleAttrTest) {
     t.setattr(cid, hoid, "bar", val2);
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
+  }
+  {
+    bool r = store->collection_empty(cid);
+    ASSERT_TRUE(!r);
   }
   {
     bufferptr bp;
