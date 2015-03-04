@@ -310,13 +310,33 @@ TEST_P(StoreTest, SimpleAttrTest) {
   int r;
   coll_t cid;
   ghobject_t hoid(hobject_t(sobject_t("attr object 1", CEPH_NOSNAP)));
-  bufferlist val;
+  bufferlist val, val2;
   val.append("value");
+  val.append("value2");
+  {
+    bufferptr bp;
+    map<string,bufferptr> aset;
+    r = store->getattr(cid, hoid, "nofoo", bp);
+    ASSERT_EQ(-ENOENT, r);
+    r = store->getattrs(cid, hoid, aset);
+    ASSERT_EQ(-ENOENT, r);
+  }
   {
     ObjectStore::Transaction t;
     t.create_collection(cid);
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  {
+    bufferptr bp;
+    r = store->getattr(cid, hoid, "nofoo", bp);
+    ASSERT_EQ(-ENOENT, r);
+  }
+  {
+    ObjectStore::Transaction t;
     t.touch(cid, hoid);
     t.setattr(cid, hoid, "foo", val);
+    t.setattr(cid, hoid, "bar", val2);
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
   }
@@ -324,11 +344,17 @@ TEST_P(StoreTest, SimpleAttrTest) {
     bufferptr bp;
     r = store->getattr(cid, hoid, "nofoo", bp);
     ASSERT_EQ(-ENODATA, r);
+
     r = store->getattr(cid, hoid, "foo", bp);
     ASSERT_EQ(0, r);
     bufferlist bl;
     bl.append(bp);
     ASSERT_TRUE(bl.contents_equal(val));
+
+    map<string,bufferptr> bm;
+    r = store->getattrs(cid, hoid, bm);
+    ASSERT_EQ(0, r);
+
   }
   {
     ObjectStore::Transaction t;

@@ -711,7 +711,7 @@ int NewStore::getattr(
   dout(15) << __func__ << " " << cid << " " << oid << " " << name << dendl;
   CollectionRef c = _get_collection(cid);
   if (!c)
-    return false;
+    return -ENOENT;
   RWLock::RLocker l(c->lock);
   int r;
   string k(name);
@@ -739,7 +739,24 @@ int NewStore::getattrs(
   const ghobject_t& oid,
   map<string,bufferptr>& aset)
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid << " " << oid << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  RWLock::RLocker l(c->lock);
+  int r;
+
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  aset = o->onode.attrs;
+  r = 0;
+ out:
+  dout(10) << __func__ << " " << cid << " " << oid
+	   << " = " << r << dendl;
+  return r;
 }
 
 int NewStore::list_collections(vector<coll_t>& ls)
