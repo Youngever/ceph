@@ -306,6 +306,39 @@ TEST_P(StoreTest, SimpleObjectTest) {
   }
 }
 
+TEST_P(StoreTest, SimpleAttrTest) {
+  int r;
+  coll_t cid;
+  ghobject_t hoid(hobject_t(sobject_t("attr object 1", CEPH_NOSNAP)));
+  bufferlist val;
+  val.append("value");
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid);
+    t.touch(cid, hoid);
+    t.setattr(cid, hoid, "foo", val);
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  {
+    bufferptr bp;
+    r = store->getattr(cid, hoid, "nofoo", bp);
+    ASSERT_EQ(-ENODATA, r);
+    r = store->getattr(cid, hoid, "foo", bp);
+    ASSERT_EQ(0, r);
+    bufferlist bl;
+    bl.append(bp);
+    ASSERT_TRUE(bl.contents_equal(val));
+  }
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, hoid);
+    t.remove_collection(cid);
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+}
+
 TEST_P(StoreTest, SimpleListTest) {
   int r;
   coll_t cid(spg_t(pg_t(0, 1), shard_id_t(1)));

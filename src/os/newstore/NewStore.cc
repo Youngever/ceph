@@ -708,7 +708,30 @@ int NewStore::getattr(
   const char *name,
   bufferptr& value)
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid << " " << oid << " " << name << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return false;
+  RWLock::RLocker l(c->lock);
+  int r;
+  string k(name);
+
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+
+  if (!o->onode.attrs.count(k)) {
+    r = -ENODATA;
+    goto out;
+  }
+  value = o->onode.attrs[k];
+  r = 0;
+ out:
+  dout(10) << __func__ << " " << cid << " " << oid << " " << name
+	   << " = " << r << dendl;
+  return r;
 }
 
 int NewStore::getattrs(
