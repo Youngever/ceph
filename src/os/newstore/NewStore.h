@@ -223,7 +223,7 @@ private:
   ceph::unordered_map<coll_t, CollectionRef> coll_map;
 
   Mutex fid_lock;
-  fid_t cur_fid;
+  fid_t fid_cur;
 
   Mutex wal_lock;
   atomic64_t wal_seq;

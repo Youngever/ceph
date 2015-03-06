@@ -977,16 +977,16 @@ int NewStore::_create_fid(fid_t *fid)
 {
   {
     Mutex::Locker l(fid_lock);
-    if (cur_fid.fset > 0 &&
-	cur_fid.fno > 0 &&
-	cur_fid.fno < g_conf->newstore_max_dir_size) {
-      ++cur_fid.fno;
+    if (fid_cur.fset > 0 &&
+	fid_cur.fno > 0 &&
+	fid_cur.fno < g_conf->newstore_max_dir_size) {
+      ++fid_cur.fno;
     } else {
-      ++cur_fid.fset;
-      cur_fid.fno = 1;
-      dout(10) << __func__ << " creating " << cur_fid.fset << dendl;
+      ++fid_cur.fset;
+      fid_cur.fno = 1;
+      dout(10) << __func__ << " creating " << fid_cur.fset << dendl;
       char s[32];
-      snprintf(s, sizeof(s), "%u", cur_fid.fset);
+      snprintf(s, sizeof(s), "%u", fid_cur.fset);
       int r = ::mkdirat(frag_fd, s, 0755);
       if (r < 0) {
 	r = -errno;
@@ -1003,10 +1003,10 @@ int NewStore::_create_fid(fid_t *fid)
 	     << s << ": " << cpp_strerror(r) << dendl;
       }
     }
-    *fid = cur_fid;
+    *fid = fid_cur;
   }
 
-  dout(10) << __func__ << " " << cur_fid << dendl;
+  dout(10) << __func__ << " " << fid_cur << dendl;
   char s[32];
   snprintf(s, sizeof(s), "%u", fid->fno);
   int fd = ::openat(fset_fd, s, O_RDWR|O_CREAT, 0644);
@@ -1034,7 +1034,7 @@ int NewStore::_create_fid(fid_t *fid)
 int NewStore::_remove_fid(fid_t fid)
 {
   char fn[32];
-  snprintf(fn, sizeof(fn), "%u/%u", cur_fid.fset, cur_fid.fno);
+  snprintf(fn, sizeof(fn), "%u/%u", fid.fset, fid.fno);
   int r = ::unlinkat(frag_fd, fn, 0);
   if (r < 0)
     return -errno;
@@ -1659,7 +1659,6 @@ int NewStore::_do_write(TransContextRef txc,
       o->onode.size = offset + length;
     dout(20) << __func__ << " wal " << f.fid << " write "
 	     << (offset - f.offset) << "~" << length << dendl;
-
   }
   r = 0;
 
