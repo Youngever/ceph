@@ -315,6 +315,13 @@ public:
     bufferlist& bl,
     uint32_t op_flags = 0,
     bool allow_eio = false);
+  int _do_read(
+    OnodeRef o,
+    uint64_t offset,
+    size_t len,
+    bufferlist& bl,
+    uint32_t op_flags = 0);
+
   int fiemap(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len, bufferlist& bl);
   int getattr(coll_t cid, const ghobject_t& oid, const char *name, bufferptr& value);
   int getattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr>& aset);
@@ -403,6 +410,11 @@ private:
 	     uint64_t offset, size_t len,
 	     const bufferlist& bl,
 	     uint32_t fadvise_flags);
+  int _do_write(TransContextRef txc,
+		OnodeRef o,
+		uint64_t offset, uint64_t length,
+		const bufferlist& bl,
+		uint32_t fadvise_flags);
   int _touch(TransContextRef& txc,
 	     CollectionRef& c,
 	     const ghobject_t& oid);
@@ -437,6 +449,11 @@ private:
 	     CollectionRef& c,
 	     const ghobject_t& old_oid,
 	     const ghobject_t& new_oid);
+  int _clone_range(TransContextRef& txc,
+		   CollectionRef& c,
+		   const ghobject_t& old_oid,
+		   const ghobject_t& new_oid,
+		   uint64_t srcoff, uint64_t length, uint64_t dstoff);
   int _create_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
   int _remove_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
   void _finish_remove_collections(TransContextRef& txc);

@@ -599,15 +599,36 @@ int NewStore::read(
   RWLock::RLocker l(c->lock);
 
   int r;
-  int fd = -1;
-  fid_t cur_fid;
-  map<uint64_t,fragment_t>::iterator p;
 
   OnodeRef o = c->get_onode(oid, false);
   if (!o || !o->exists) {
     r = -ENOENT;
     goto out;
   }
+
+  r = _do_read(o, offset, length, bl, op_flags);
+
+ out:
+  dout(10) << __func__ << " " << cid << " " << oid
+	   << " " << offset << "~" << length
+	   << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_do_read(
+    OnodeRef o,
+    uint64_t offset,
+    size_t length,
+    bufferlist& bl,
+    uint32_t op_flags)
+{
+  map<uint64_t,fragment_t>::iterator p;
+  int r;
+  int fd = -1;
+  fid_t cur_fid;
+
+  dout(20) << __func__ << " " << offset << "~" << length << " size "
+	   << o->onode.size << dendl;
 
   if (offset > o->onode.size) {
     r = 0;
@@ -621,9 +642,13 @@ int NewStore::read(
   o->wait_wal();
 
   r = 0;
-  for (p = o->onode.data_map.lower_bound(offset);
+  for (p = o->onode.data_map.begin();   // fixme
        length > 0 && p != o->onode.data_map.end();
        ++p) {
+    dout(30) << __func__ << " x " << p->first << "~" << p->second.length << dendl;
+    if (p->first > offset && p != o->onode.data_map.begin()) {
+      --p;
+    }
     if (p->first + p->second.length <= offset) {
       dout(30) << __func__ << " skipping " << p->first << "~" << p->second.length
 	       << dendl;
@@ -668,8 +693,9 @@ int NewStore::read(
       goto out;
     }
     if ((unsigned)r < x_len) {
-      derr << __func__ << "   short read " << r << " from " << cur_fid
-	   << " offset " << p->second.offset + x_off << dendl;
+      derr << __func__ << "   short read " << r << " < " << x_len
+	   << " from " << cur_fid << " offset " << p->second.offset + x_off
+	   << dendl;
       r = -EIO;
       goto out;
     }
@@ -684,13 +710,10 @@ int NewStore::read(
     bl.push_back(bp);
   }
   r = bl.length();
-
  out:
-  dout(10) << __func__ << " " << cid << " " << oid
-	   << " " << offset << "~" << length
-	   << " = " << r << dendl;
   return r;
 }
+
 
 int NewStore::fiemap(
   coll_t cid,
@@ -942,7 +965,7 @@ ObjectMap::ObjectMapIterator NewStore::get_omap_iterator(
 int NewStore::_open_fid(fid_t fid)
 {
   char fn[32];
-  snprintf(fn, sizeof(fn), "%u/%u", cur_fid.fset, cur_fid.fno);
+  snprintf(fn, sizeof(fn), "%u/%u", fid.fset, fid.fno);
   int fd = ::openat(frag_fd, fn, O_RDWR);
   if (fd < 0)
     return -errno;
@@ -1350,8 +1373,7 @@ int NewStore::_do_transaction(Transaction *t,
         uint64_t srcoff = op->off;
         uint64_t len = op->len;
         uint64_t dstoff = op->dest_off;
-	assert(0 == "write me");
-	//r = _clone_range(cid, oid, noid, srcoff, len, dstoff);
+	r = _clone_range(txc, c, oid, noid, srcoff, len, dstoff);
       }
       break;
 
@@ -1573,6 +1595,79 @@ int NewStore::_touch(TransContextRef& txc,
   return r;
 }
 
+int NewStore::_do_write(TransContextRef txc,
+			OnodeRef o,
+			uint64_t offset, uint64_t length,
+			const bufferlist& bl,
+			uint32_t fadvise_flags)
+{
+  int fd = -1;
+  int r = 0;
+
+  dout(20) << __func__ << " have " << o->onode.size
+	   << " bytes in " << o->onode.data_map.size()
+	   << " fragments" << dendl;
+
+  o->exists = true;
+
+  if (o->onode.size == offset ||
+      o->onode.size == 0) {
+    if (o->onode.data_map.empty()) {
+      // create
+      fragment_t &f = o->onode.data_map[0];
+      f.offset = 0;
+      f.length = offset + length;
+      fd = _create_fid(&f.fid);
+      if (fd < 0) {
+	r = fd;
+	goto out;
+      }
+      ::lseek64(fd, offset, SEEK_SET);
+      dout(20) << __func__ << " create " << f.fid << " writing "
+	       << offset << "~" << length << dendl;
+    } else {
+      // append (possibly with gap)
+      assert(o->onode.data_map.size() == 1);
+      fragment_t &f = o->onode.data_map.rbegin()->second;
+      f.length = (offset + length) - f.offset;
+      fd = _open_fid(f.fid);
+      if (fd < 0) {
+	r = fd;
+	goto out;
+      }
+      ::lseek64(fd, offset - f.offset, SEEK_SET);
+      dout(20) << __func__ << " append " << f.fid << " writing "
+	       << (offset - f.offset) << "~" << length << dendl;
+    }
+    o->onode.size = offset + length;
+    r = bl.write_fd(fd);
+    if (r < 0)
+      goto out;
+    txc->sync_fd(fd);
+  } else {
+    // WAL
+    assert(o->onode.data_map.size() == 1);
+    const fragment_t& f = o->onode.data_map.begin()->second;
+    assert(f.offset == 0);
+    wal_op_t *op = _get_wal_op(txc);
+    op->op = wal_op_t::OP_WRITE;
+    op->offset = offset - f.offset;
+    op->length = length;
+    op->fid = f.fid;
+    op->data = bl;
+    if (offset + length > o->onode.size)
+      o->onode.size = offset + length;
+    dout(20) << __func__ << " wal " << f.fid << " write "
+	     << (offset - f.offset) << "~" << length << dendl;
+
+  }
+  r = 0;
+
+ out:
+  return r;
+}
+
+
 int NewStore::_write(TransContextRef& txc,
 		     CollectionRef& c,
 		     const ghobject_t& oid,
@@ -1586,52 +1681,8 @@ int NewStore::_write(TransContextRef& txc,
   int r;
   RWLock::WLocker l(c->lock);
   OnodeRef o = c->get_onode(oid, true);
-  int fd;
 
-  o->exists = true;
-
-  if (o->onode.size == offset) {
-    if (o->onode.data_map.empty()) {
-      // create
-      fragment_t &f = o->onode.data_map[0];
-      f.offset = 0;
-      f.length = length;
-      fd = _create_fid(&f.fid);
-      if (fd < 0) {
-	r = fd;
-	goto out;
-      }
-      ::lseek64(fd, offset, SEEK_SET);
-    } else {
-      // append
-      assert(o->onode.data_map.size() == 1);
-      fragment_t &f = o->onode.data_map.rbegin()->second;
-      f.length += length;
-      fd = _open_fid(f.fid);
-      if (fd < 0) {
-	r = fd;
-	goto out;
-      }
-      ::lseek64(fd, offset, SEEK_SET);
-    }
-    o->onode.size = offset + length;
-    r = bl.write_fd(fd);
-    txc->sync_fd(fd);
-  } else {
-    // WAL
-    assert(o->onode.data_map.size() == 1);
-    const fragment_t& f = o->onode.data_map.begin()->second;
-    assert(f.offset == 0);
-    wal_op_t *op = _get_wal_op(txc);
-    op->op = wal_op_t::OP_WRITE;
-    op->offset = offset;
-    op->length = length;
-    op->fid = f.fid;
-    op->data = bl;
-    if (offset + length > o->onode.size)
-      o->onode.size;
-  }
-
+  r = _do_write(txc, o, offset, length, bl, fadvise_flags);
   txc->write_onode(o);
 
  out:
@@ -1691,6 +1742,10 @@ int NewStore::_truncate(TransContextRef& txc,
     op->fid = f.fid;
     assert(f.offset == 0);
     f.length = offset;
+  } else if (offset > o->onode.size) {
+    // resize file up.  make sure we don't have trailing
+    // garbage!
+    // FIXME !!
   }
   o->onode.size = offset;
   txc->write_onode(o);
@@ -1852,13 +1907,86 @@ int NewStore::_clone(TransContextRef& txc,
 	   << new_oid << dendl;
   int r = 0;
 
-  assert(0 == "writ eme");
+  RWLock::WLocker l(c->lock);
+  bufferlist bl;
+  OnodeRef newo;
+  OnodeRef oldo = c->get_onode(old_oid, false);
+  if (!oldo || !oldo->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  newo = c->get_onode(new_oid, true);
+  assert(newo);
+  newo->exists = true;
+
+  r = _do_read(oldo, 0, oldo->onode.size, bl, 0);
+  if (r < 0)
+    goto out;
+
+  // truncate any old data
+  while (!newo->onode.data_map.empty()) {
+    wal_op_t *op = _get_wal_op(txc);
+    op->op = wal_op_t::OP_REMOVE;
+    op->fid = newo->onode.data_map.rbegin()->second.fid;
+    newo->onode.data_map.erase(newo->onode.data_map.rbegin()->first);
+  }
+
+  r = _do_write(txc, newo, 0, oldo->onode.size, bl, 0);
+
+  newo->onode.attrs = oldo->onode.attrs;
+  // fixme: omap
+
+  txc->write_onode(newo);
+
+  r = 0;
 
  out:
   dout(10) << __func__ << " " << c->cid << " " << old_oid << " -> "
 	   << new_oid << " = " << r << dendl;
   return r;
 }
+
+int NewStore::_clone_range(TransContextRef& txc,
+			   CollectionRef& c,
+			   const ghobject_t& old_oid,
+			   const ghobject_t& new_oid,
+			   uint64_t srcoff, uint64_t length, uint64_t dstoff)
+{
+  dout(15) << __func__ << " " << c->cid << " " << old_oid << " -> "
+	   << new_oid << " from " << srcoff << "~" << length
+	   << " to offset " << dstoff << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  bufferlist bl;
+  OnodeRef newo;
+  OnodeRef oldo = c->get_onode(old_oid, false);
+  if (!oldo || !oldo->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  newo = c->get_onode(new_oid, true);
+  assert(newo);
+  newo->exists = true;
+
+  r = _do_read(oldo, srcoff, length, bl, 0);
+  if (r < 0)
+    goto out;
+
+  r = _do_write(txc, newo, dstoff, bl.length(), bl, 0);
+
+  txc->write_onode(newo);
+
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << old_oid << " -> "
+	   << new_oid << " from " << srcoff << "~" << length
+	   << " to offset " << dstoff
+	   << " = " << r << dendl;
+  return r;
+}
+
 
 
 // collections
