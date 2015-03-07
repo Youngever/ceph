@@ -255,6 +255,7 @@ private:
 
   CollectionRef _get_collection(coll_t cid);
 
+  int _recover_next_fid();
   int _create_fid(fid_t *fid);
   int _open_fid(fid_t fid);
   int _remove_fid(fid_t fid);

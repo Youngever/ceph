@@ -151,7 +151,7 @@ NewStore::OnodeRef NewStore::Collection::get_onode(
     // loaded
     on = new Onode(oid, key);
     bufferlist::iterator p = v.begin();
-    ::decode(o->onode, p);
+    ::decode(on->onode, p);
   }
 
   return onode_map.add(oid, on, NULL);
@@ -478,6 +478,10 @@ int NewStore::mount()
   r = _open_db();
   if (r < 0)
     goto out_frag;
+
+  r = _recover_next_fid();
+  if (r < 0)
+    goto out_db;
 
   finisher.start();
 
@@ -961,6 +965,35 @@ ObjectMap::ObjectMapIterator NewStore::get_omap_iterator(
 
 // -----------------
 // write helpers
+
+int NewStore::_recover_next_fid()
+{
+  unsigned i=1;
+  while (true) {
+    char fn[32];
+    snprintf(fn, sizeof(fn), "%u", i);
+    struct stat st;
+    derr << "frag_fd " << frag_fd << " fn " << fn << dendl;
+    int r = ::fstatat(frag_fd, fn, &st, 0);
+    if (r == 0) {
+      ++i;
+      continue;
+    }
+    r = -errno;
+    if (r == -ENOENT)
+      break;
+    assert(r < 0);
+    derr << __func__ << " failed to stat " << path << "/fragments/" << fn
+	 << ": " << cpp_strerror(r) << dendl;
+    return r;
+  }
+  fid_cur.fset = i - 1;
+  fid_cur.fno = 0;
+  dout(10) << __func__ << " stopped somewhere in " << fid_cur << dendl;
+
+  // FIXME: we should probably recover fno too so that we don't create
+  // a new fset dir on every daemon restart.
+}
 
 int NewStore::_open_fid(fid_t fid)
 {
