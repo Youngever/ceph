@@ -993,6 +993,8 @@ int NewStore::_recover_next_fid()
 
   // FIXME: we should probably recover fno too so that we don't create
   // a new fset dir on every daemon restart.
+
+  return 0;
 }
 
 int NewStore::_open_fid(fid_t fid)
@@ -1431,7 +1433,7 @@ int NewStore::_do_transaction(Transaction *t,
           ::decode(pg_num, hiter);
           ::decode(num_objs, hiter);
           //r = _collection_hint_expected_num_objs(cid, pg_num, num_objs);
-#warning write me
+	  assert(0 == "write me");
         } else {
           // Ignore the hint
           dout(10) << "Unrecognized collection hint type: " << type << dendl;
@@ -1460,12 +1462,10 @@ int NewStore::_do_transaction(Transaction *t,
 
     case Transaction::OP_COLL_MOVE_RENAME:
       {
-        coll_t oldcid = i.get_cid(op->cid);
+	assert(op->cid == op->dest_cid);
         ghobject_t oldoid = i.get_oid(op->oid);
-        coll_t newcid = i.get_cid(op->dest_cid);
         ghobject_t newoid = i.get_oid(op->dest_oid);
-	//r = _collection_move_rename(oldcid, oldoid, newcid, newoid);
-#warning writ eme
+	r = _rename(txc, c, oldoid, newoid);
       }
       break;
 
@@ -1486,7 +1486,7 @@ int NewStore::_do_transaction(Transaction *t,
         coll_t cid = i.get_cid(op->cid);
         ghobject_t oid = i.get_oid(op->oid);
 	//r = _omap_clear(cid, oid);
-#warning write me
+	assert(0 == "write me");
       }
       break;
     case Transaction::OP_OMAP_SETKEYS:
@@ -1496,7 +1496,7 @@ int NewStore::_do_transaction(Transaction *t,
         map<string, bufferlist> aset;
         i.decode_attrset(aset);
 	//r = _omap_setkeys(cid, oid, aset);
-#warning write me
+	assert(0 == "write me");
       }
       break;
     case Transaction::OP_OMAP_RMKEYS:
@@ -1506,7 +1506,7 @@ int NewStore::_do_transaction(Transaction *t,
         set<string> keys;
         i.decode_keyset(keys);
 	//r = _omap_rmkeys(cid, oid, keys);
-#warning write me
+	assert(0 == "write me");
       }
       break;
     case Transaction::OP_OMAP_RMKEYRANGE:
@@ -1517,7 +1517,7 @@ int NewStore::_do_transaction(Transaction *t,
         first = i.decode_string();
         last = i.decode_string();
 	//r = _omap_rmkeyrange(cid, oid, first, last);
-#warning write me
+	assert(0 == "write me");
       }
       break;
     case Transaction::OP_OMAP_SETHEADER:
@@ -1527,7 +1527,7 @@ int NewStore::_do_transaction(Transaction *t,
         bufferlist bl;
         i.decode_bl(bl);
 	//r = _omap_setheader(cid, oid, bl);
-#warning write me
+	assert(0 == "write me");
       }
       break;
     case Transaction::OP_SPLIT_COLLECTION:
@@ -1535,13 +1535,10 @@ int NewStore::_do_transaction(Transaction *t,
       break;
     case Transaction::OP_SPLIT_COLLECTION2:
       {
-        coll_t cid = i.get_cid(op->cid);
         uint32_t bits = op->split_bits;
         uint32_t rem = op->split_rem;
         coll_t dest = i.get_cid(op->dest_cid);
-	//r = _split_collection(cid, bits, rem, dest);
-#warning write me
-
+	r = _split_collection(txc, c, bits, rem, dest, &cvec[op->dest_cid]);
       }
       break;
 
@@ -1549,7 +1546,7 @@ int NewStore::_do_transaction(Transaction *t,
       {
         coll_t cid = i.get_cid(op->cid);
         ghobject_t oid = i.get_oid(op->oid);
-#warning write me
+	assert(0 == "write me");
       }
       break;
 
@@ -1623,7 +1620,6 @@ int NewStore::_touch(TransContextRef& txc,
   assert(o);
   o->exists = true;
   txc->write_onode(o);
- out:
   dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
   return r;
 }
@@ -1710,14 +1706,11 @@ int NewStore::_write(TransContextRef& txc,
   dout(15) << __func__ << " " << c->cid << " " << oid
 	   << " " << offset << "~" << length
 	   << dendl;
-  int r;
   RWLock::WLocker l(c->lock);
   OnodeRef o = c->get_onode(oid, true);
-
-  r = _do_write(txc, o, offset, length, bl, fadvise_flags);
+  int r = _do_write(txc, o, offset, length, bl, fadvise_flags);
   txc->write_onode(o);
 
- out:
   dout(10) << __func__ << " " << c->cid << " " << oid
 	   << " " << offset << "~" << length
 	   << " = " << r << dendl;
@@ -1789,19 +1782,10 @@ int NewStore::_truncate(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_remove(TransContextRef& txc,
-		      CollectionRef& c,
-		      const ghobject_t& oid)
+int NewStore::_do_remove(TransContextRef& txc,
+			 OnodeRef o)
 {
-  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
-  int r;
-  RWLock::WLocker l(c->lock);
   string key;
-  OnodeRef o = c->get_onode(oid, true);
-  if (!o || !o->exists) {
-    r = -ENOENT;
-    goto out;
-  }
   o->exists = false;
   if (!o->onode.data_map.empty()) {
     for (map<uint64_t,fragment_t>::iterator p = o->onode.data_map.begin();
@@ -1815,10 +1799,24 @@ int NewStore::_remove(TransContextRef& txc,
   o->onode.data_map.clear();
   o->onode.size = 0;
 
-  get_object_key(oid, &key);
+  get_object_key(o->oid, &key);
   txc->t->rmkey(PREFIX_OBJ, key);
+  return 0;
+}
 
-  r = 0;
+int NewStore::_remove(TransContextRef& txc,
+		      CollectionRef& c,
+		      const ghobject_t& oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r;
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, true);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  r = _do_remove(txc, o);
 
  out:
   dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
@@ -2019,7 +2017,50 @@ int NewStore::_clone_range(TransContextRef& txc,
   return r;
 }
 
+int NewStore::_rename(TransContextRef& txc,
+		      CollectionRef& c,
+		      const ghobject_t& old_oid,
+		      const ghobject_t& new_oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << old_oid << " -> "
+	   << new_oid << dendl;
+  int r;
 
+  RWLock::WLocker l(c->lock);
+  bufferlist bl;
+  string old_key, new_key;
+  OnodeRef newo;
+  OnodeRef oldo = c->get_onode(old_oid, false);
+  if (!oldo || !oldo->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  newo = c->get_onode(new_oid, true);
+  assert(newo);
+
+  if (newo->exists) {
+    r = _do_remove(txc, newo);
+    if (r < 0)
+      return r;
+  }
+
+  assert(0 == "write me");
+  /*
+  get_object_key(old_oid, NULL);
+  get_object_key(new_oid, &new_key);
+  //c->onode_map.add(new_key, oldo, NULL);
+  //c->onode_map.remove(old_key, oldo);
+  oldo->oid = new_oid;
+  oldo->key = new_key;
+  */
+  txc->write_onode(oldo);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << old_oid << " -> "
+	   << new_oid << " = " << r << dendl;
+  return r;
+}
 
 // collections
 
@@ -2101,7 +2142,14 @@ void NewStore::_finish_remove_collections(TransContextRef& txc)
   }
 }
 
-
-
+int NewStore::_split_collection(TransContextRef& txc,
+				CollectionRef& c,
+				int bits, int rem,
+				coll_t destcid,
+				CollectionRef *destc)
+{
+  assert(0 == "write me");
+  return 0;
+}
 
 // ===========================================

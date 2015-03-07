@@ -430,6 +430,8 @@ private:
   int _remove(TransContextRef& txc,
 	      CollectionRef& c,
 	      const ghobject_t& oid);
+  int _do_remove(TransContextRef& txc,
+		 OnodeRef o);
   int _setattr(TransContextRef& txc,
 	       CollectionRef& c,
 	       const ghobject_t& oid,
@@ -455,8 +457,15 @@ private:
 		   const ghobject_t& old_oid,
 		   const ghobject_t& new_oid,
 		   uint64_t srcoff, uint64_t length, uint64_t dstoff);
+  int _rename(TransContextRef& txc,
+	      CollectionRef& c,
+	      const ghobject_t& old_oid,
+	      const ghobject_t& new_oid);
   int _create_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
   int _remove_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
+  int _split_collection(TransContextRef& txc, CollectionRef& c,
+			int bits, int rem, coll_t dest,
+			CollectionRef *destc);
   void _finish_remove_collections(TransContextRef& txc);
   friend class C_FinishRemoveCollections;
 
