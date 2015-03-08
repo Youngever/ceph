@@ -1727,11 +1727,11 @@ void colsplittest(
   unsigned common_suffix_size
   ) {
   coll_t cid(spg_t(pg_t(0,52),shard_id_t::NO_SHARD));
-  coll_t tid(spg_t(pg_t(0,32),shard_id_t::NO_SHARD));
+  coll_t tid(spg_t(pg_t(1<<common_suffix_size,52),shard_id_t::NO_SHARD));
   int r = 0;
   {
     ObjectStore::Transaction t;
-    t.create_collection(cid, 0);
+    t.create_collection(cid, common_suffix_size);
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
   }
@@ -1752,7 +1752,7 @@ void colsplittest(
   }
   {
     ObjectStore::Transaction t;
-    t.create_collection(tid, 0);
+    t.create_collection(tid, common_suffix_size + 1);
     t.split_collection(cid, common_suffix_size+1, 0, tid);
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);

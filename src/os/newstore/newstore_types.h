@@ -22,6 +22,19 @@ namespace ceph {
   class Formatter;
 }
 
+/// collection metadata
+struct cnode_t {
+  uint32_t bits;   ///< how many bits of coll pgid are significant
+
+  cnode_t(int b=0) : bits(b) {}
+
+  void encode(bufferlist& bl) const;
+  void decode(bufferlist::iterator& p);
+  void dump(Formatter *f) const;
+  static void generate_test_instances(list<cnode_t*>& o);
+};
+WRITE_CLASS_ENCODER(cnode_t)
+
 /// unique id for a local file
 struct fid_t {
   uint32_t fset, fno;

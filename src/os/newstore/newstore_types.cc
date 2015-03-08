@@ -15,6 +15,36 @@
 #include "newstore_types.h"
 #include "common/Formatter.h"
 
+// cnode_t
+
+void cnode_t::encode(bufferlist& bl) const
+{
+  ENCODE_START(1, 1, bl);
+  ::encode(bits, bl);
+  ENCODE_FINISH(bl);
+}
+
+void cnode_t::decode(bufferlist::iterator& p)
+{
+  DECODE_START(1, p);
+  ::decode(bits, p);
+  DECODE_FINISH(p);
+}
+
+void cnode_t::dump(Formatter *f) const
+{
+  f->dump_unsigned("bits", bits);
+}
+
+void cnode_t::generate_test_instances(list<cnode_t*>& o)
+{
+  o.push_back(new cnode_t());
+  o.push_back(new cnode_t(0));
+  o.push_back(new cnode_t(123));
+}
+
+// fit_t
+
 void fid_t::dump(Formatter *f) const
 {
   f->dump_unsigned("fset", fset);
@@ -27,6 +57,8 @@ void fid_t::generate_test_instances(list<fid_t*>& o)
   o.push_back(new fid_t(0, 1));
   o.push_back(new fid_t(123, 3278));
 }
+
+// fragment_t
 
 void fragment_t::encode(bufferlist& bl) const
 {
@@ -60,6 +92,7 @@ void fragment_t::generate_test_instances(list<fragment_t*>& o)
   o.push_back(new fragment_t(789, 1024, fid_t(3, 400)));
 }
 
+// onode_t
 
 void onode_t::encode(bufferlist& bl) const
 {
@@ -109,6 +142,8 @@ void onode_t::generate_test_instances(list<onode_t*>& o)
   o.push_back(new onode_t());
   // FIXME
 }
+
+// wal_op_t
 
 void wal_op_t::encode(bufferlist& bl) const
 {

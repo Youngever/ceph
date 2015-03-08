@@ -88,9 +88,11 @@ static int decode_escaped(const char *p, string *out)
 // here is a sample (large) key
 // --.7fffffffffffffff.B9FA767A.!0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!fffffffffffffffe.ffffffffffffffff
 
-static void get_coll_key(const coll_t& cid, string *key)
+static void get_coll_key_range(const coll_t& cid, int bits,
+			       string *start, string *end)
 {
-  key->clear();
+  start->clear();
+  end->clear();
 
   spg_t pgid;
   if (cid.is_pg(&pgid)) {
@@ -99,18 +101,32 @@ static void get_coll_key(const coll_t& cid, string *key)
     // make field ordering match with ghobject_t compare operations
     if (pgid.shard == shard_id_t::NO_SHARD) {
       // otherwise ff will sort *after* 0, not before.
-      *key = "--";
+      *start = "--";
     } else {
       snprintf(buf, sizeof(buf), "%02x", (int)pgid.shard);
-      key->append(buf);
+      start->append(buf);
     }
+    *end = *start;
 
     snprintf(buf, sizeof(buf), ".%016llx.%08X.",
 	     (unsigned long long)(pgid.pool() + 0x8000000000000000ull),
 	     (unsigned)hobject_t::_reverse_nibbles(pgid.ps()));
-    key->append(buf);
+    start->append(buf);
+
+    uint64_t end_hash = hobject_t::_reverse_nibbles(pgid.ps());
+    end_hash += (1ull << (32-bits));
+    if (end_hash > 0xffffffff) {
+      snprintf(buf, sizeof(buf), ".%016llx.GGGGGGGG.",
+	       (unsigned long long)(pgid.pool() + 0x8000000000000000ull));
+    } else {
+      snprintf(buf, sizeof(buf), ".%016llx.%08X.",
+	       (unsigned long long)(pgid.pool() + 0x8000000000000000ull),
+	       (unsigned)end_hash);
+    }
+    end->append(buf);
   } else if (cid.is_meta()) {
-    *key = "--.7ffffffffffffff.00000000.";
+    *start = "--.7ffffffffffffff.00000000.";
+    *end = "--.7ffffffffffffff.GGGGGGGG.";
   } else {
     assert(0);
   }
@@ -239,6 +255,15 @@ NewStore::OnodeRef NewStore::Collection::get_onode(
   bool create)
 {
   assert(create ? lock.is_wlocked() : lock.is_locked());
+
+  spg_t pgid;
+  if (cid.is_pg(&pgid)) {
+    if (!oid.match(cnode.bits, pgid.ps())) {
+      derr << __func__ << " oid " << oid << " not part of " << pgid
+	   << " bits " << cnode.bits << dendl;
+      assert(0);
+    }
+  }
 
   OnodeRef o = onode_map.lookup(oid);
   if (o)
@@ -501,6 +526,25 @@ void NewStore::_close_db()
   db = NULL;
 }
 
+int NewStore::_open_collections()
+{
+  for (KeyValueDB::Iterator it = db->get_iterator(PREFIX_COLL);
+       it->valid();
+       it->next()) {
+    coll_t cid;
+    if (cid.parse(it->key())) {
+      CollectionRef c(new Collection(this, cid));
+      bufferlist bl;
+      db->get(PREFIX_COLL, it->key(), &bl);
+      bufferlist::iterator p = bl.begin();
+      ::decode(c->cnode, p);
+      dout(20) << __func__ << " opened " << cid << dendl;
+      coll_map[cid] = c;
+    }
+  }
+  return 0;
+}
+
 int NewStore::mkfs()
 {
   dout(1) << __func__ << " path " << path << dendl;
@@ -594,6 +638,10 @@ int NewStore::mount()
     goto out_frag;
 
   r = _recover_next_fid();
+  if (r < 0)
+    goto out_db;
+
+  r = _open_collections();
   if (r < 0)
     goto out_db;
 
@@ -946,11 +994,13 @@ int NewStore::collection_list(coll_t cid, vector<ghobject_t>& o)
   RWLock::RLocker l(c->lock);
   int r = 0;
   KeyValueDB::Iterator it = db->get_iterator(PREFIX_OBJ);
-  string prefix;
-  get_coll_key(cid, &prefix);
-  dout(20) << __func__ << " prefix " << prefix << dendl;
-  it->upper_bound(prefix);
+  string start_key, end_key;
+  get_coll_key_range(cid, c->cnode.bits, &start_key, &end_key);
+  dout(20) << __func__ << " range " << start_key << " to " << end_key << dendl;
+  it->upper_bound(start_key);
   while (it->valid()) {
+    if (strcmp(it->key().c_str(), end_key.c_str()) > 0)
+      break;
     dout(20) << __func__ << " key " << it->key() << dendl;
     ghobject_t oid;
     int r = get_key_object(it->key(), &oid);
@@ -976,25 +1026,32 @@ int NewStore::collection_list_partial(
   RWLock::RLocker l(c->lock);
   int r = 0;
   KeyValueDB::Iterator it;
-  string start_key;
+  string start_key, start_range_key, end_key;
+  bool set_next = false;
   if (start == ghobject_t::get_max())
     goto out;
-  it = db->get_iterator(PREFIX_OBJ);
+  get_coll_key_range(cid, c->cnode.bits, &start_range_key, &end_key);
   get_object_key(start, &start_key);
+  dout(20) << __func__ << " range " << start_range_key << " to " << end_key
+	   << " start " << start << dendl;
+  it = db->get_iterator(PREFIX_OBJ);
   it->upper_bound(start_key);
   while (it->valid()) {
+    if (strcmp(it->key().c_str(), end_key.c_str()) > 0)
+      break;
     dout(20) << __func__ << " key " << it->key() << dendl;
     ghobject_t oid;
     int r = get_key_object(it->key(), &oid);
     assert(r == 0);
     ls->push_back(oid);
-    it->next();
     if (ls->size() >= (unsigned)max) {
       *pnext = oid;
+      set_next = true;
       break;
     }
+    it->next();
   }
-  if (!it->valid()) {
+  if (!set_next) {
     *pnext = ghobject_t::get_max();
   }
  out:
@@ -1546,7 +1603,7 @@ int NewStore::_do_transaction(Transaction *t,
       {
 	assert(!c);
         coll_t cid = i.get_cid(op->cid);
-	r = _create_collection(txc, cid, &c);
+	r = _create_collection(txc, cid, op->split_bits, &c);
       }
       break;
 
@@ -1668,8 +1725,7 @@ int NewStore::_do_transaction(Transaction *t,
       {
         uint32_t bits = op->split_bits;
         uint32_t rem = op->split_rem;
-        coll_t dest = i.get_cid(op->dest_cid);
-	r = _split_collection(txc, c, bits, rem, dest, &cvec[op->dest_cid]);
+	r = _split_collection(txc, c, cvec[op->dest_cid], bits, rem);
       }
       break;
 
@@ -2198,11 +2254,12 @@ int NewStore::_rename(TransContextRef& txc,
 int NewStore::_create_collection(
   TransContextRef& txc,
   coll_t cid,
+  unsigned bits,
   CollectionRef *c)
 {
-  dout(15) << __func__ << " " << cid << dendl;
+  dout(15) << __func__ << " " << cid << " bits " << bits << dendl;
   int r;
-  bufferlist empty;
+  bufferlist bl;
 
   {
     RWLock::WLocker l(coll_lock);
@@ -2211,13 +2268,15 @@ int NewStore::_create_collection(
       goto out;
     }
     c->reset(new Collection(this, cid));
+    (*c)->cnode.bits = bits;
     coll_map[cid] = *c;
   }
-  txc->t->set(PREFIX_COLL, stringify(cid), empty);
+  ::encode((*c)->cnode, bl);
+  txc->t->set(PREFIX_COLL, stringify(cid), bl);
   r = 0;
 
  out:
-  dout(10) << __func__ << " " << cid << " = " << r << dendl;
+  dout(10) << __func__ << " " << cid << " bits " << bits << " = " << r << dendl;
   return r;
 }
 
@@ -2275,12 +2334,23 @@ void NewStore::_finish_remove_collections(TransContextRef& txc)
 
 int NewStore::_split_collection(TransContextRef& txc,
 				CollectionRef& c,
-				int bits, int rem,
-				coll_t destcid,
-				CollectionRef *destc)
+				CollectionRef& d,
+				unsigned bits, int rem)
 {
-  assert(0 == "write me");
-  return 0;
+  dout(15) << __func__ << " " << c->cid << " to " << d->cid << " "
+	   << " bits " << bits << dendl;
+  int r;
+  RWLock::WLocker l(c->lock);
+  RWLock::WLocker l2(d->lock);
+  c->onode_map.clear();
+  d->onode_map.clear();
+  c->cnode.bits = bits;
+  assert(d->cnode.bits == bits);
+  r = 0;
+
+  dout(10) << __func__ << " " << c->cid << " to " << d->cid << " "
+	   << " bits " << bits << " = " << r << dendl;
+  return r;
 }
 
 // ===========================================

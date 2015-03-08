@@ -76,6 +76,7 @@ public:
   struct Collection {
     NewStore *store;
     coll_t cid;
+    cnode_t cnode;
     RWLock lock;
 
     // cache onodes on a per-collection basis to avoid lock
@@ -252,6 +253,8 @@ private:
   void _close_frag();
   int _open_db();
   void _close_db();
+  int _open_collections();
+  void _close_collections();
 
   CollectionRef _get_collection(coll_t cid);
 
@@ -461,11 +464,13 @@ private:
 	      CollectionRef& c,
 	      const ghobject_t& old_oid,
 	      const ghobject_t& new_oid);
-  int _create_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
+  int _create_collection(TransContextRef& txc, coll_t cid, unsigned bits,
+			 CollectionRef *c);
   int _remove_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
-  int _split_collection(TransContextRef& txc, CollectionRef& c,
-			int bits, int rem, coll_t dest,
-			CollectionRef *destc);
+  int _split_collection(TransContextRef& txc,
+			CollectionRef& c,
+			CollectionRef& d,
+			unsigned bits, int rem);
   void _finish_remove_collections(TransContextRef& txc);
   friend class C_FinishRemoveCollections;
 
