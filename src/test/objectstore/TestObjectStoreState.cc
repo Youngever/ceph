@@ -38,7 +38,7 @@ void TestObjectStoreState::init(int colls, int objs)
   ObjectStore::Transaction *t;
   t = new ObjectStore::Transaction;
 
-  t->create_collection(META_COLL);
+  t->create_collection(META_COLL, 0);
   m_store->apply_transaction(*t);
 
   wait_for_ready();
@@ -51,7 +51,7 @@ void TestObjectStoreState::init(int colls, int objs)
         << " meta " << entry->m_meta_obj.oid.name << dendl;
 
     t = new ObjectStore::Transaction;
-    t->create_collection(entry->m_coll);
+    t->create_collection(entry->m_coll, 32);
     bufferlist hint;
     uint32_t pg_num = colls;
     uint64_t num_objs = uint64_t(objs / colls);
