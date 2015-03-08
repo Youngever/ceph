@@ -67,6 +67,57 @@ static void append_escaped(const string &in, string *out)
   }
 }
 
+static int decode_escaped(const char *p, string *out)
+{
+  const char *orig_p = p;
+  while (*p && *p != '!') {
+    if (*p == '%') {
+      unsigned hex;
+      int r = sscanf(++p, "%2x", &hex);
+      if (r < 1)
+	return -EINVAL;
+      out->push_back((char)hex);
+      p += 2;
+    } else {
+      out->push_back(*p++);
+    }
+  }
+  return p - orig_p;
+}
+
+// here is a sample (large) key
+// --.7fffffffffffffff.B9FA767A.!0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!fffffffffffffffe.ffffffffffffffff
+
+static void get_coll_key(const coll_t& cid, string *key)
+{
+  key->clear();
+
+  spg_t pgid;
+  if (cid.is_pg(&pgid)) {
+    char buf[PATH_MAX];
+
+    // make field ordering match with ghobject_t compare operations
+    if (pgid.shard == shard_id_t::NO_SHARD) {
+      // otherwise ff will sort *after* 0, not before.
+      *key = "--";
+    } else {
+      snprintf(buf, sizeof(buf), "%02x", (int)pgid.shard);
+      key->append(buf);
+    }
+
+    snprintf(buf, sizeof(buf), ".%016llx.%08X.",
+	     (unsigned long long)(pgid.pool() + 0x8000000000000000ull),
+	     (unsigned)hobject_t::_reverse_nibbles(pgid.ps()));
+    key->append(buf);
+  } else if (cid.is_meta()) {
+    *key = "--.7ffffffffffffff.00000000.";
+  } else {
+    assert(0);
+  }
+}
+
+static int get_key_object(const string& key, ghobject_t *oid);
+
 static void get_object_key(const ghobject_t& oid, string *key)
 {
   char buf[PATH_MAX];
@@ -85,7 +136,7 @@ static void get_object_key(const ghobject_t& oid, string *key)
   }
 
   t += snprintf(t, end - t, ".%016llx.%.*X.",
-		(long long)(oid.hobj.pool + 0x8000000000000000),
+		(unsigned long long)(oid.hobj.pool + 0x8000000000000000ull),
 		(int)(sizeof(oid.hobj.get_hash())*2),
 		(uint32_t)oid.get_filestore_key_u32());
   key->append(buf);
@@ -93,7 +144,7 @@ static void get_object_key(const ghobject_t& oid, string *key)
   append_escaped(oid.hobj.nspace, key);
   key->append(KEY_SEP_S);
 
-  append_escaped(oid.hobj.get_key(), key);
+  append_escaped(oid.hobj.get_effective_key(), key);
   key->append(KEY_SEP_S);
 
   append_escaped(oid.hobj.oid.name, key);
@@ -104,7 +155,70 @@ static void get_object_key(const ghobject_t& oid, string *key)
 		(long long unsigned)oid.hobj.snap,
 		(long long unsigned)oid.generation);
   key->append(buf);
+
+  // sanity check
+  if (true) {
+    ghobject_t t;
+    int r = get_key_object(*key, &t);
+    if (r || t != oid) {
+      derr << "  r " << r << dendl;
+      derr << "key " << *key << dendl;
+      derr << "oid " << oid << dendl;
+      derr << "  t " << t << dendl;
+      assert(t == oid);
+    }
+  }
 }
+
+static int get_key_object(const string& key, ghobject_t *oid)
+{
+  int r;
+  const char *p = key.c_str();
+
+  if (key[0] == '-') {
+    oid->shard_id = shard_id_t::NO_SHARD;
+  } else {
+    unsigned shard;
+    r = sscanf(p, "%x", &shard);
+    if (r < 1)
+      return -1;
+    oid->shard_id = shard_id_t(shard);
+  }
+  if (p[2] != '.' || p[19] != '.' || p[28] != '.')
+    return -2;
+
+  unsigned hash;
+  uint64_t pool;
+  r = sscanf(p + 3, "%llx.%x", (unsigned long long*)&pool, &hash);
+  if (r < 2)
+    return -3;
+  oid->hobj.pool = pool - 0x8000000000000000;
+  oid->hobj.set_filestore_key_u32(hash);
+  p += 3 + 2 + 16 + 8;
+
+  r = decode_escaped(p, &oid->hobj.nspace);
+  if (r < 0)
+    return -4;
+  p += r + 1;
+  string okey;
+  r = decode_escaped(p, &okey);
+  if (r < 0)
+    return -5;
+  p += r + 1;
+  r = decode_escaped(p, &oid->hobj.oid.name);
+  if (r < 0)
+    return -6;
+  p += r + 1;
+
+  oid->hobj.set_key(okey);
+
+  r = sscanf(p, "%llx.%llx", (unsigned long long*)&oid->hobj.snap,
+	     (unsigned long long*)&oid->generation);
+  if (r < 2)
+    return -7;
+  return 0;
+}
+
 
 // =======================================================
 
@@ -831,11 +945,18 @@ int NewStore::collection_list(coll_t cid, vector<ghobject_t>& o)
     return -ENOENT;
   RWLock::RLocker l(c->lock);
   int r = 0;
-  pair<ghobject_t,OnodeRef> next;
-  while (c->onode_map.get_next(next.first, &next)) {
-    if (next.second->exists) {
-      o.push_back(next.first);
-    }
+  KeyValueDB::Iterator it = db->get_iterator(PREFIX_OBJ);
+  string prefix;
+  get_coll_key(cid, &prefix);
+  dout(20) << __func__ << " prefix " << prefix << dendl;
+  it->upper_bound(prefix);
+  while (it->valid()) {
+    dout(20) << __func__ << " key " << it->key() << dendl;
+    ghobject_t oid;
+    int r = get_key_object(it->key(), &oid);
+    assert(r == 0);
+    o.push_back(oid);
+    it->next();
   }
   dout(10) << __func__ << " " << cid << " = " << r << dendl;
   return r;
@@ -854,24 +975,33 @@ int NewStore::collection_list_partial(
     return -ENOENT;
   RWLock::RLocker l(c->lock);
   int r = 0;
-  pair<ghobject_t,OnodeRef> next;
-  next.first = start;
-  while (true) {
-    if (!c->onode_map.get_next(next.first, &next)) {
-      *pnext = ghobject_t::get_max();
+  KeyValueDB::Iterator it;
+  string start_key;
+  if (start == ghobject_t::get_max())
+    goto out;
+  it = db->get_iterator(PREFIX_OBJ);
+  get_object_key(start, &start_key);
+  it->upper_bound(start_key);
+  while (it->valid()) {
+    dout(20) << __func__ << " key " << it->key() << dendl;
+    ghobject_t oid;
+    int r = get_key_object(it->key(), &oid);
+    assert(r == 0);
+    ls->push_back(oid);
+    it->next();
+    if (ls->size() >= (unsigned)max) {
+      *pnext = oid;
       break;
     }
-    if (next.second->exists) {
-      ls->push_back(next.first);
-      if (ls->size() >= (unsigned)max) {
-	*pnext = next.first;
-	break;
-      }
-    }
   }
+  if (!it->valid()) {
+    *pnext = ghobject_t::get_max();
+  }
+ out:
   dout(10) << __func__ << " " << cid
 	   << " start " << start << " min/max " << min << "/" << max
-	   << " snap " << snap << " = " << r << dendl;
+	   << " snap " << snap << " = " << r << ", ls.size() = " << ls->size()
+	   << ", next = " << *pnext << dendl;
   return r;
 }
 
@@ -1432,11 +1562,12 @@ int NewStore::_do_transaction(Transaction *t,
           uint64_t num_objs;
           ::decode(pg_num, hiter);
           ::decode(num_objs, hiter);
-          //r = _collection_hint_expected_num_objs(cid, pg_num, num_objs);
-	  assert(0 == "write me");
+          dout(10) << __func__ << " collection hint objects is a no-op, "
+		   << " pg_num " << pg_num << " num_objects " << num_objs
+		   << dendl;
         } else {
           // Ignore the hint
-          dout(10) << "Unrecognized collection hint type: " << type << dendl;
+          dout(10) << __func__ << " unknown collection hint " << type << dendl;
         }
       }
       break;
