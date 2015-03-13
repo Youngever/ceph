@@ -999,8 +999,10 @@ int NewStore::collection_list(coll_t cid, vector<ghobject_t>& o)
   dout(20) << __func__ << " range " << start_key << " to " << end_key << dendl;
   it->upper_bound(start_key);
   while (it->valid()) {
-    if (strcmp(it->key().c_str(), end_key.c_str()) > 0)
+    if (strcmp(it->key().c_str(), end_key.c_str()) > 0) {
+      dout(20) << __func__ << " key " << it->key() << " > " << end_key << dendl;
       break;
+    }
     dout(20) << __func__ << " key " << it->key() << dendl;
     ghobject_t oid;
     int r = get_key_object(it->key(), &oid);
@@ -1037,8 +1039,10 @@ int NewStore::collection_list_partial(
   it = db->get_iterator(PREFIX_OBJ);
   it->upper_bound(start_key);
   while (it->valid()) {
-    if (strcmp(it->key().c_str(), end_key.c_str()) > 0)
+    if (strcmp(it->key().c_str(), end_key.c_str()) > 0) {
+      dout(20) << __func__ << " key " << it->key() << " > " << end_key << dendl;
       break;
+    }
     dout(20) << __func__ << " key " << it->key() << dendl;
     ghobject_t oid;
     int r = get_key_object(it->key(), &oid);
