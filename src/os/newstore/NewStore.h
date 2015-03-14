@@ -273,6 +273,15 @@ public:
     }
   };
 
+  struct KVSyncThread : public Thread {
+    NewStore *store;
+    KVSyncThread(NewStore *s) : store(s) {}
+    void *entry() {
+      store->_kv_sync_thread();
+      return NULL;
+    }
+  };
+
   // --------------------------------------------------------
   // members
 private:
@@ -298,9 +307,11 @@ private:
   ThreadPool fsync_tp;
   FsyncWQ fsync_wq;
 
-  Mutex tx_lock;
-  Cond tx_cond;
-  deque<Context*> tx_finishers;
+  KVSyncThread kv_sync_thread;
+  Mutex kv_lock;
+  Cond kv_cond;
+  bool kv_stop;
+  deque<TransContextRef> kv_queue, kv_committing;
 
   Logger *logger;
 
@@ -337,7 +348,16 @@ private:
   TransContext *_txc_create(OpSequencer *osr);
   int _txc_finalize(OpSequencer *osr, TransContextRef& txc);
   void _txc_queue_fsync(TransContextRef& txc);
-  void _txc_submit(TransContextRef& txc);
+  void _txc_submit_kv(TransContextRef& txc);
+  void _txc_finish(TransContextRef txc);
+
+  void _kv_sync_thread();
+  void _kv_stop() {
+    Mutex::Locker l(kv_lock);
+    kv_stop = true;
+    kv_cond.Signal();
+  }
+
   wal_op_t *_get_wal_op(TransContextRef& txc);
   int _apply_wal_transaction(TransContextRef& txc);
   void _wait_object_wal(OnodeRef onode);

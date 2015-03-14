@@ -338,7 +338,9 @@ NewStore::NewStore(CephContext *cct, const string& path)
 	     cct->_conf->newstore_fsync_thread_timeout,
 	     cct->_conf->newstore_fsync_thread_suicide_timeout,
 	     &fsync_tp),
-    tx_lock("NewStore::tx_lock"),
+    kv_sync_thread(this),
+    kv_lock("NewStore::kv_lock"),
+    kv_stop(false),
     logger(NULL),
     default_osr("default")
 {
@@ -668,6 +670,7 @@ int NewStore::mount()
 
   finisher.start();
   fsync_tp.start();
+  kv_sync_thread.create();
 
   mounted = true;
   return 0;
@@ -687,6 +690,7 @@ int NewStore::umount()
 {
   assert(mounted);
   dout(1) << __func__ << dendl;
+  _kv_stop();
   finisher.wait_for_empty();
   fsync_tp.drain();
   fsync_tp.stop();
@@ -1304,7 +1308,7 @@ void NewStore::FsyncWQ::_process(fsync_item *i, ThreadPool::TPHandle &handle)
   int r = ::fdatasync(i->fd);
   assert(r == 0);
   if (i->txc->finish_fsync()) {
-    store->_txc_submit(i->txc);
+    store->_txc_submit_kv(i->txc);
   }
   delete i;
 }
@@ -1345,14 +1349,80 @@ void NewStore::_txc_queue_fsync(TransContextRef& txc)
   fsync_wq.unlock();
 }
 
-void NewStore::_txc_submit(TransContextRef& txc)
+void NewStore::_txc_submit_kv(TransContextRef& txc)
 {
   dout(20) << __func__ << " txc " << txc << dendl;
 
-  Mutex::Locker l(tx_lock);
+  Mutex::Locker l(kv_lock);
   db->submit_transaction(txc->t);
-  tx_finishers.push_back(txc->oncommit);
-  tx_cond.SignalOne();
+  kv_queue.push_back(txc);
+  kv_cond.SignalOne();
+}
+
+struct C_ApplyWAL : public Context {
+  NewStore *store;
+  NewStore::TransContextRef txc;
+  C_ApplyWAL(NewStore *s, NewStore::TransContextRef& t) : store(s), txc(t) {}
+  void finish(int r) {
+    store->_apply_wal_transaction(txc);
+  }
+};
+
+struct C_FinishRemoveCollections : public Context {
+  NewStore *store;
+  NewStore::TransContextRef txc;
+  C_FinishRemoveCollections(NewStore *s, NewStore::TransContextRef t)
+    : store(s), txc(t) {}
+  void finish(int r) {
+    store->_finish_remove_collections(txc);
+  }
+};
+
+void NewStore::_txc_finish(TransContextRef txc)
+{
+  dout(20) << __func__ << " txc " << txc << dendl;
+
+  if (txc->oncommit)
+      finisher.queue(txc->oncommit);
+
+  if (txc->wal_txn) {
+    dout(20) << __func__ << " starting wal apply" << dendl;
+    txc->start_wal_apply();
+    finisher.queue(new C_ApplyWAL(this, txc));
+  } else {
+    dout(20) << __func__ << " no wal" << dendl;
+  }
+
+  if (!txc->removed_collections.empty()) {
+    finisher.queue(new C_FinishRemoveCollections(this, txc));
+  }
+}
+
+void NewStore::_kv_sync_thread()
+{
+  dout(10) << __func__ << " start" << dendl;
+  kv_lock.Lock();
+  while (true) {
+    assert(kv_committing.empty());
+    if (!kv_queue.empty()) {
+      if (kv_stop)
+	break;
+      dout(20) << __func__ << " sleep" << dendl;
+      kv_cond.Wait(kv_lock);
+      dout(20) << __func__ << " wake" << dendl;
+    } else {
+      dout(20) << __func__ << " committing " << kv_queue.size() << dendl;
+      kv_committing.swap(kv_queue);
+      db->submit_transaction_sync(db->get_transaction());
+      dout(20) << __func__ << " committed " << kv_queue.size() << dendl;
+      while (!kv_committing.empty()) {
+	_txc_finish(kv_committing.front());
+	kv_committing.pop_front();
+      }
+    }
+  }
+  kv_lock.Unlock();
+  dout(10) << __func__ << " finish" << dendl;
 }
 
 wal_op_t *NewStore::_get_wal_op(TransContextRef& txc)
@@ -1431,27 +1501,8 @@ int NewStore::_apply_wal_transaction(TransContextRef& txc)
   return 0;
 }
 
-struct C_ApplyWAL : public Context {
-  NewStore *store;
-  NewStore::TransContextRef txc;
-  C_ApplyWAL(NewStore *s, NewStore::TransContextRef& t) : store(s), txc(t) {}
-  void finish(int r) {
-    store->_apply_wal_transaction(txc);
-  }
-};
-
 // ---------------------------
 // transactions
-
-struct C_FinishRemoveCollections : public Context {
-  NewStore *store;
-  NewStore::TransContextRef txc;
-  C_FinishRemoveCollections(NewStore *s, NewStore::TransContextRef t)
-    : store(s), txc(t) {}
-  void finish(int r) {
-    store->_finish_remove_collections(txc);
-  }
-};
 
 int NewStore::queue_transactions(
     Sequencer *posr,
@@ -1493,6 +1544,8 @@ int NewStore::queue_transactions(
   if (onreadable)
     finisher.queue(onreadable);
 
+  txc->oncommit = ondisk;
+
   r = _txc_finalize(osr, txc);
   assert(r == 0);
 
@@ -1512,28 +1565,14 @@ int NewStore::queue_transactions(
 
     db->submit_transaction_sync(txc->t);
 
-    if (ondisk)
-      finisher.queue(ondisk);
-
-    if (txc->wal_txn) {
-      dout(20) << __func__ << " starting wal apply" << dendl;
-      txc->start_wal_apply();
-      finisher.queue(new C_ApplyWAL(this, txc));
-    } else {
-      dout(20) << __func__ << " no wal" << dendl;
-    }
-
-    if (!txc->removed_collections.empty()) {
-      finisher.queue(new C_FinishRemoveCollections(this, txc));
-    }
+    _txc_finish(txc);
   } else {
     // async path
-    txc->oncommit = ondisk;
 
     if (!txc->fds.empty()) {
       _txc_queue_fsync(txc);
     } else {
-      _txc_submit(txc);
+      _txc_submit_kv(txc);
     }
   }
 
