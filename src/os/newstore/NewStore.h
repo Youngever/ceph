@@ -15,12 +15,15 @@
 #ifndef CEPH_OSD_NEWSTORE_H
 #define CEPH_OSD_NEWSTORE_H
 
+#include <unistd.h>
+
 #include "include/assert.h"
 #include "include/unordered_map.h"
 #include "include/memory.h"
 #include "common/Finisher.h"
 #include "common/RWLock.h"
 #include "common/shared_cache.hpp"
+#include "common/WorkQueue.h"
 #include "os/ObjectStore.h"
 #include "os/KeyValueDB.h"
 
@@ -58,10 +61,11 @@ public:
     bool dirty;     // ???
     bool exists;
 
+    Mutex wal_lock;  ///< protect unappliex_txns, num_fsyncs
+    Cond wal_cond;   ///< wait here for unapplied txns, fsyncs
+
     //list<TransContextRef> uncommitted_txns; ///< pending txns
     list<TransContext*> unapplied_txns;   ///< committed but unapplied txns
-    Mutex wal_lock;  ///< protect unappliex_txns
-    Cond wal_cond;   ///< wait here for unapplied txns
 
     Onode(const ghobject_t& o, const string& k);
 
@@ -138,13 +142,19 @@ public:
     list<int> fds;             ///< these fds need to be synced
     list<OnodeRef> onodes;     ///< these onodes need to be updated/written
     KeyValueDB::Transaction t; ///< then we will commit this
-    list<Context*> oncommit;   ///< signal on commit
+    Context *oncommit;         ///< signal on commit
     list<CollectionRef> removed_collections; ///< colls we removed
 
     wal_transaction_t *wal_txn; ///< wal transaction (if any)
+    unsigned num_fsyncs_completed;
+
+    Mutex lock;
+    Cond cond;
 
     TransContext()
-      : wal_txn(NULL) {}
+      : wal_txn(NULL),
+	num_fsyncs_completed(0),
+	lock("NewStore::TransContext::lock") {}
     ~TransContext() {
       delete wal_txn;
     }
@@ -154,6 +164,21 @@ public:
     }
     void write_onode(OnodeRef &o) {
       onodes.push_back(o);
+    }
+
+    bool finish_fsync() {
+      Mutex::Locker l(lock);
+      ++num_fsyncs_completed;
+      if (num_fsyncs_completed == fds.size()) {
+	cond.Signal();
+	return true;
+      }
+      return false;
+    }
+    void wait_fsync() {
+      Mutex::Locker l(lock);
+      while (num_fsyncs_completed < fds.size())
+	cond.Wait(lock);
     }
 
     void start_wal_apply() {
@@ -202,11 +227,51 @@ public:
 	delete c;
 	return true;
       }
-      q.back()->oncommit.push_back(c); /// XXX onreadable?
+      //q.back()->oncommit.push_back(c); /// XXX onreadable?
+#warning fixme
       return false;
     }
   };
 
+  struct fsync_item {
+    int fd;
+    TransContextRef txc;
+    fsync_item(int f, TransContextRef t) : fd(f), txc(t) {}
+  };
+  class FsyncWQ : public ThreadPool::WorkQueue<fsync_item> {
+    NewStore *store;
+    deque<fsync_item*> fd_queue;
+
+  public:
+    FsyncWQ(NewStore *s, time_t ti, time_t sti, ThreadPool *tp)
+      : ThreadPool::WorkQueue<fsync_item>("NewStore::FsyncWQ", ti, sti, tp),
+	store(s) {
+    }
+    bool _empty() {
+      return fd_queue.empty();
+    }
+    bool _enqueue(fsync_item *i) {
+      fd_queue.push_back(i);
+      return true;
+    }
+    void _dequeue(fsync_item *p) {
+      assert(0 == "not needed, not implemented");
+    }
+    fsync_item *_dequeue() {
+      if (fd_queue.empty())
+	return NULL;
+      fsync_item *i = fd_queue.front();
+      fd_queue.pop_front();
+      return i;
+    }
+    void _process(fsync_item *i, ThreadPool::TPHandle &handle);
+    void _clear() {
+      while (!fd_queue.empty()) {
+	delete fd_queue.front();
+	fd_queue.pop_front();
+      }
+    }
+  };
 
   // --------------------------------------------------------
   // members
@@ -230,6 +295,13 @@ private:
   atomic64_t wal_seq;
 
   Finisher finisher;
+  ThreadPool fsync_tp;
+  FsyncWQ fsync_wq;
+
+  Mutex tx_lock;
+  Cond tx_cond;
+  deque<Context*> tx_finishers;
+
   Logger *logger;
 
   Sequencer default_osr;
@@ -262,8 +334,10 @@ private:
   int _create_fid(fid_t *fid);
   int _open_fid(fid_t fid);
   int _remove_fid(fid_t fid);
-  TransContext *_create_txc(OpSequencer *osr);
-  int _finalize_txc(OpSequencer *osr, TransContextRef& txc);
+  TransContext *_txc_create(OpSequencer *osr);
+  int _txc_finalize(OpSequencer *osr, TransContextRef& txc);
+  void _txc_queue_fsync(TransContextRef& txc);
+  void _txc_submit(TransContextRef& txc);
   wal_op_t *_get_wal_op(TransContextRef& txc);
   int _apply_wal_transaction(TransContextRef& txc);
   void _wait_object_wal(OnodeRef onode);

@@ -25,6 +25,18 @@
 #include "common/errno.h"
 #include "common/safe_io.h"
 
+/*
+
+  TODO:
+
+  * async queue_transaction
+  * prealloc fids
+  * sequencer flush machinery
+  * omap
+  * hobject sorting
+
+ */
+
 const string PREFIX_COLL = "C"; // collection name -> (nothing)
 const string PREFIX_OBJ = "O";  // object name -> onode
 const string PREFIX_WAL = "L";  // write ahead log
@@ -108,7 +120,7 @@ static void get_coll_key_range(const coll_t& cid, int bits,
     }
     *end = *start;
 
-    snprintf(buf, sizeof(buf), ".%016llx.%08X.",
+    snprintf(buf, sizeof(buf), ".%016llx.%08x.",
 	     (unsigned long long)(pgid.pool() + 0x8000000000000000ull),
 	     (unsigned)hobject_t::_reverse_nibbles(pgid.ps()));
     start->append(buf);
@@ -116,17 +128,17 @@ static void get_coll_key_range(const coll_t& cid, int bits,
     uint64_t end_hash = hobject_t::_reverse_nibbles(pgid.ps());
     end_hash += (1ull << (32-bits));
     if (end_hash > 0xffffffff) {
-      snprintf(buf, sizeof(buf), ".%016llx.GGGGGGGG.",
+      snprintf(buf, sizeof(buf), ".%016llx.gggggggg.",
 	       (unsigned long long)(pgid.pool() + 0x8000000000000000ull));
     } else {
-      snprintf(buf, sizeof(buf), ".%016llx.%08X.",
+      snprintf(buf, sizeof(buf), ".%016llx.%08x.",
 	       (unsigned long long)(pgid.pool() + 0x8000000000000000ull),
 	       (unsigned)end_hash);
     }
     end->append(buf);
   } else if (cid.is_meta()) {
-    *start = "--.7ffffffffffffff.00000000.";
-    *end = "--.7ffffffffffffff.GGGGGGGG.";
+    *start = "--.7fffffffffffffff.00000000.";
+    *end =   "--.7fffffffffffffff.gggggggg.";
   } else {
     assert(0);
   }
@@ -151,7 +163,7 @@ static void get_object_key(const ghobject_t& oid, string *key)
     key->append(buf);
   }
 
-  t += snprintf(t, end - t, ".%016llx.%.*X.",
+  t += snprintf(t, end - t, ".%016llx.%.*x.",
 		(unsigned long long)(oid.hobj.pool + 0x8000000000000000ull),
 		(int)(sizeof(oid.hobj.get_hash())*2),
 		(uint32_t)oid.get_filestore_key_u32());
@@ -318,6 +330,15 @@ NewStore::NewStore(CephContext *cct, const string& path)
     wal_lock("NewStore::wal_lock"),
     wal_seq(0),
     finisher(cct),
+    fsync_tp(cct,
+	     "NewStore::fsync_tp",
+	     cct->_conf->newstore_fsync_threads,
+	     "newstore_fsync_threads"),
+    fsync_wq(this,
+	     cct->_conf->newstore_fsync_thread_timeout,
+	     cct->_conf->newstore_fsync_thread_suicide_timeout,
+	     &fsync_tp),
+    tx_lock("NewStore::tx_lock"),
     logger(NULL),
     default_osr("default")
 {
@@ -646,6 +667,7 @@ int NewStore::mount()
     goto out_db;
 
   finisher.start();
+  fsync_tp.start();
 
   mounted = true;
   return 0;
@@ -666,6 +688,8 @@ int NewStore::umount()
   assert(mounted);
   dout(1) << __func__ << dendl;
   finisher.wait_for_empty();
+  fsync_tp.drain();
+  fsync_tp.stop();
   mounted = false;
   if (fset_fd >= 0)
     VOID_TEMP_FAILURE_RETRY(::close(fset_fd));
@@ -1267,7 +1291,7 @@ int NewStore::_remove_fid(fid_t fid)
   return 0;
 }
 
-NewStore::TransContext *NewStore::_create_txc(OpSequencer *osr)
+NewStore::TransContext *NewStore::_txc_create(OpSequencer *osr)
 {
   TransContext *txc = new TransContext;
   txc->t = db->get_transaction();
@@ -1275,7 +1299,17 @@ NewStore::TransContext *NewStore::_create_txc(OpSequencer *osr)
   return txc;
 }
 
-int NewStore::_finalize_txc(OpSequencer *osr, TransContextRef& txc)
+void NewStore::FsyncWQ::_process(fsync_item *i, ThreadPool::TPHandle &handle)
+{
+  int r = ::fdatasync(i->fd);
+  assert(r == 0);
+  if (i->txc->finish_fsync()) {
+    store->_txc_submit(i->txc);
+  }
+  delete i;
+}
+
+int NewStore::_txc_finalize(OpSequencer *osr, TransContextRef& txc)
 {
   dout(20) << __func__ << " osr " << osr << " txc " << txc << dendl;
 
@@ -1297,6 +1331,28 @@ int NewStore::_finalize_txc(OpSequencer *osr, TransContextRef& txc)
   }
 
   return 0;
+}
+
+void NewStore::_txc_queue_fsync(TransContextRef& txc)
+{
+  dout(20) << __func__ << " txc " << txc << dendl;
+  fsync_wq.lock();
+  for (list<int>::iterator p = txc->fds.begin();
+       p != txc->fds.end();
+       ++p) {
+    fsync_wq._enqueue(new fsync_item(*p, txc));
+  }
+  fsync_wq.unlock();
+}
+
+void NewStore::_txc_submit(TransContextRef& txc)
+{
+  dout(20) << __func__ << " txc " << txc << dendl;
+
+  Mutex::Locker l(tx_lock);
+  db->submit_transaction(txc->t);
+  tx_finishers.push_back(txc->oncommit);
+  tx_cond.SignalOne();
 }
 
 wal_op_t *NewStore::_get_wal_op(TransContextRef& txc)
@@ -1424,7 +1480,7 @@ int NewStore::queue_transactions(
     dout(5) << __func__ << " new " << *osr << "/" << osr->parent << dendl;
   }
 
-  TransContextRef txc(_create_txc(osr));
+  TransContextRef txc(_txc_create(osr));
 
   // XXX do it sync for now; this is not crash safe
   for (list<Transaction*>::iterator p = tls.begin(); p != tls.end(); ++p) {
@@ -1437,37 +1493,48 @@ int NewStore::queue_transactions(
   if (onreadable)
     finisher.queue(onreadable);
 
-  // XXX fixme
-  r = _finalize_txc(osr, txc);
+  r = _txc_finalize(osr, txc);
   assert(r == 0);
 
-  /// XXX fixme: use aio fsync
-  for (list<int>::iterator p = txc->fds.begin(); p != txc->fds.end(); ++p) {
-    dout(30) << __func__ << " fsync " << *p << dendl;
-    int r = ::fsync(*p);
-    if (r < 0) {
-      r = -errno;
-      derr << __func__ << " fsync: " << cpp_strerror(r) << dendl;
-      return r;
+  if (g_conf->newstore_sync_queue_transaction) {
+    // do it syncrhonously.  for example, if we have a *very* fast backend.
+
+    // sync
+    for (list<int>::iterator p = txc->fds.begin(); p != txc->fds.end(); ++p) {
+      dout(30) << __func__ << " fsync " << *p << dendl;
+      int r = ::fsync(*p);
+      if (r < 0) {
+	r = -errno;
+	derr << __func__ << " fsync: " << cpp_strerror(r) << dendl;
+	return r;
+      }
     }
-  }
 
-  // XXX
-  db->submit_transaction_sync(txc->t);
+    db->submit_transaction_sync(txc->t);
 
-  if (ondisk)
-    finisher.queue(ondisk);
+    if (ondisk)
+      finisher.queue(ondisk);
 
-  if (txc->wal_txn) {
-    dout(20) << __func__ << " starting wal apply" << dendl;
-    txc->start_wal_apply();
-    finisher.queue(new C_ApplyWAL(this, txc));
+    if (txc->wal_txn) {
+      dout(20) << __func__ << " starting wal apply" << dendl;
+      txc->start_wal_apply();
+      finisher.queue(new C_ApplyWAL(this, txc));
+    } else {
+      dout(20) << __func__ << " no wal" << dendl;
+    }
+
+    if (!txc->removed_collections.empty()) {
+      finisher.queue(new C_FinishRemoveCollections(this, txc));
+    }
   } else {
-    dout(20) << __func__ << " no wal" << dendl;
-  }
+    // async path
+    txc->oncommit = ondisk;
 
-  if (!txc->removed_collections.empty()) {
-    finisher.queue(new C_FinishRemoveCollections(this, txc));
+    if (!txc->fds.empty()) {
+      _txc_queue_fsync(txc);
+    } else {
+      _txc_submit(txc);
+    }
   }
 
   return 0;
