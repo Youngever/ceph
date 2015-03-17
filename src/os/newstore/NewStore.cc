@@ -854,6 +854,7 @@ int NewStore::_do_read(
       bufferptr bp(l);
       bp.zero();
       bl.append(bp);
+      length = length - l;
     }
     if (p->second.fid != cur_fid) {
       cur_fid = p->second.fid;
