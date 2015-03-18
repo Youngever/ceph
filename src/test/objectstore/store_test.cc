@@ -294,6 +294,7 @@ TEST_P(StoreTest, SimpleObjectTest) {
     exp.append("abcabcdede");
     r = store->read(cid, hoid, 0, 10, in);
     ASSERT_EQ(10, r);
+    in.hexdump(cout);
     ASSERT_TRUE(in.contents_equal(exp));
   }
   {

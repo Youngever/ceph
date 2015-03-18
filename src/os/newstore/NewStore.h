@@ -181,7 +181,7 @@ public:
 	cond.Wait(lock);
     }
 
-    void start_wal_apply() {
+    void mark_wal_onodes() {
       for (list<OnodeRef>::iterator p = onodes.begin(); p != onodes.end(); ++p) {
 	Mutex::Locker l((*p)->wal_lock);
 	(*p)->unapplied_txns.push_back(this);
@@ -195,6 +195,9 @@ public:
 	if ((*p)->unapplied_txns.empty())
 	  (*p)->wal_cond.Signal();
       }
+
+      // clear out refs
+      onodes.clear();
     }
   };
   typedef ceph::shared_ptr<TransContext> TransContextRef;
@@ -353,9 +356,12 @@ private:
 
   void _kv_sync_thread();
   void _kv_stop() {
-    Mutex::Locker l(kv_lock);
-    kv_stop = true;
-    kv_cond.Signal();
+    {
+      Mutex::Locker l(kv_lock);
+      kv_stop = true;
+      kv_cond.Signal();
+    }
+    kv_sync_thread.join();
   }
 
   wal_op_t *_get_wal_op(TransContextRef& txc);
