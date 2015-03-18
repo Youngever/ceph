@@ -691,15 +691,19 @@ int NewStore::umount()
 {
   assert(mounted);
   dout(1) << __func__ << dendl;
-  _kv_stop();
-  dout(10) << __func__ << " draining finisher" << dendl;
-  finisher.wait_for_empty();
-  dout(10) << __func__ << " draining sync_tp" << dendl;
-  fsync_tp.drain();
+
+  sync_and_flush();
+
+  dout(20) << __func__ << " stopping fsync_wq" << dendl;
   fsync_tp.stop();
-  dout(10) << __func__ << " stopping finisher" << dendl;
+  dout(20) << __func__ << " stopping kv thread" << dendl;
+  _kv_stop();
+  dout(20) << __func__ << " draining finisher" << dendl;
+  finisher.wait_for_empty();
+  dout(20) << __func__ << " stopping finisher" << dendl;
   finisher.stop();
-  dout(10) << __func__ << " closing" << dendl;
+  dout(20) << __func__ << " closing" << dendl;
+
   mounted = false;
   if (fset_fd >= 0)
     VOID_TEMP_FAILURE_RETRY(::close(fset_fd));
@@ -708,6 +712,39 @@ int NewStore::umount()
   _close_fsid();
   _close_path();
   return 0;
+}
+
+void NewStore::sync(Context *onsync)
+{
+
+}
+
+void NewStore::sync()
+{
+
+}
+
+void NewStore::flush()
+{
+
+}
+
+void NewStore::sync_and_flush()
+{
+  dout(10) << __func__ << dendl;
+
+  dout(20) << " flushing fsync wq" << dendl;
+  fsync_wq.flush();
+
+  kv_lock.Lock();
+  while (!kv_committing.empty() ||
+	 !kv_queue.empty()) {
+    dout(20) << " waiting for kv to commit" << dendl;
+    kv_sync_cond.Wait(kv_lock);
+  }
+  kv_lock.Unlock();
+
+  dout(10) << __func__ << " done" << dendl;
 }
 
 int NewStore::statfs(struct statfs *buf)
@@ -737,7 +774,7 @@ NewStore::Onode::Onode(const ghobject_t& o, const string& k)
     key(k),
     dirty(false),
     exists(true),
-    wal_lock("NewStore::Onode::wal_lock") {
+    flush_lock("NewStore::Onode::flush_lock") {
 }
 
 
@@ -838,7 +875,7 @@ int NewStore::_do_read(
     length = o->onode.size - offset;
   }
 
-  o->wait_wal();
+  o->flush();
 
   r = 0;
   for (p = o->onode.data_map.begin();   // fixme
@@ -1309,27 +1346,33 @@ NewStore::TransContext *NewStore::_txc_create(OpSequencer *osr)
   return txc;
 }
 
-void NewStore::FsyncWQ::_process(fsync_item *i, ThreadPool::TPHandle &handle)
+void NewStore::_txc_process_fsync(fsync_item *i)
 {
+  dout(20) << __func__ << " txc " << i->txc << dendl;
   int r = ::fdatasync(i->fd);
   assert(r == 0);
   if (i->txc->finish_fsync()) {
-    store->_txc_submit_kv(i->txc);
+    _txc_submit_kv(i->txc);
   }
+  dout(20) << __func__ << " txc " << i->txc << " done" << dendl;
   delete i;
 }
 
 int NewStore::_txc_finalize(OpSequencer *osr, TransContextRef& txc)
 {
-  dout(20) << __func__ << " osr " << osr << " txc " << txc << dendl;
+  dout(20) << __func__ << " osr " << osr << " txc " << txc
+	   << " onodes " << txc->onodes << dendl;
 
   // finalize onodes
-  for (list<OnodeRef>::iterator p = txc->onodes.begin();
+  for (set<OnodeRef>::iterator p = txc->onodes.begin();
        p != txc->onodes.end();
        ++p) {
     bufferlist bl;
     ::encode((*p)->onode, bl);
     txc->t->set(PREFIX_OBJ, (*p)->key, bl);
+
+    Mutex::Locker l((*p)->flush_lock);
+    (*p)->flush_txns.insert(txc.get());
   }
 
   // journal wal items
@@ -1338,11 +1381,6 @@ int NewStore::_txc_finalize(OpSequencer *osr, TransContextRef& txc)
     bufferlist bl;
     ::encode(*txc->wal_txn, bl);
     txc->t->set(PREFIX_WAL, stringify(txc->wal_txn->seq), bl);
-  }
-
-  if (txc->wal_txn) {
-    dout(20) << __func__ << " marking onodes affected by wal" << dendl;
-    txc->mark_wal_onodes();
   }
 
   return 0;
@@ -1356,6 +1394,7 @@ void NewStore::_txc_queue_fsync(TransContextRef& txc)
        p != txc->fds.end();
        ++p) {
     fsync_wq._enqueue(new fsync_item(*p, txc));
+    fsync_wq._wake();
   }
   fsync_wq.unlock();
 }
@@ -1389,7 +1428,7 @@ struct C_FinishRemoveCollections : public Context {
   }
 };
 
-void NewStore::_txc_finish(TransContextRef txc)
+void NewStore::_txc_finish_kv(TransContextRef txc)
 {
   dout(20) << __func__ << " txc " << txc << dendl;
 
@@ -1402,14 +1441,35 @@ void NewStore::_txc_finish(TransContextRef txc)
     dout(20) << __func__ << " starting wal apply" << dendl;
     finisher.queue(new C_ApplyWAL(this, txc));
   } else {
-    dout(20) << __func__ << " no wal" << dendl;
+    _txc_finish_apply(txc);
   }
+}
+
+void NewStore::_txc_finish_apply(TransContextRef txc)
+{
+  dout(20) << __func__ << " " << txc << " onodes " << txc->onodes << dendl;
+
+  for (set<OnodeRef>::iterator p = txc->onodes.begin();
+       p != txc->onodes.end();
+       ++p) {
+    Mutex::Locker l((*p)->flush_lock);
+    dout(20) << __func__ << " onode " << *p << " had " << (*p)->flush_txns
+	     << dendl;
+    assert((*p)->flush_txns.count(txc.get()));
+    (*p)->flush_txns.erase(txc.get());
+    if ((*p)->flush_txns.empty())
+      (*p)->flush_cond.Signal();
+  }
+
+  // clear out refs
+  txc->onodes.clear();
 
   if (!txc->removed_collections.empty()) {
     finisher.queue(new C_FinishRemoveCollections(this, txc));
     //_finish_remove_collections(txc);
   }
 }
+
 
 void NewStore::_kv_sync_thread()
 {
@@ -1421,6 +1481,7 @@ void NewStore::_kv_sync_thread()
       if (kv_stop)
 	break;
       dout(20) << __func__ << " sleep" << dendl;
+      kv_sync_cond.Signal();
       kv_cond.Wait(kv_lock);
       dout(20) << __func__ << " wake" << dendl;
     } else {
@@ -1430,7 +1491,7 @@ void NewStore::_kv_sync_thread()
       db->submit_transaction_sync(db->get_transaction());
       dout(20) << __func__ << " committed " << kv_queue.size() << dendl;
       while (!kv_committing.empty()) {
-	_txc_finish(kv_committing.front());
+	_txc_finish_kv(kv_committing.front());
 	kv_committing.pop_front();
       }
       kv_lock.Lock();
@@ -1512,8 +1573,7 @@ int NewStore::_apply_wal_transaction(TransContextRef& txc)
     VOID_TEMP_FAILURE_RETRY(::close(*p));
   }
 
-  txc->finish_wal_apply();
-
+  _txc_finish_apply(txc);
   return 0;
 }
 
@@ -1581,7 +1641,7 @@ int NewStore::queue_transactions(
 
     db->submit_transaction_sync(txc->t);
 
-    _txc_finish(txc);
+    _txc_finish_kv(txc);
   } else {
     // async path
 
@@ -2104,6 +2164,7 @@ int NewStore::_do_remove(TransContextRef& txc,
     for (map<uint64_t,fragment_t>::iterator p = o->onode.data_map.begin();
 	 p != o->onode.data_map.end();
 	 ++p) {
+      dout(20) << __func__ << " will wal remove " << p->second.fid << dendl;
       wal_op_t *op = _get_wal_op(txc);
       op->op = wal_op_t::OP_REMOVE;
       op->fid = p->second.fid;
@@ -2447,14 +2508,16 @@ void NewStore::_finish_remove_collections(TransContextRef& txc)
        ++p) {
     CollectionRef c = *p;
     dout(10) << __func__ << " " << c->cid << dendl;
-    pair<ghobject_t,OnodeRef> next;
-    while (c->onode_map.get_next(next.first, &next)) {
-      dout(10) << __func__ << " " << c->cid << " " << next.second->oid << dendl;
-      assert(!next.second->exists);
-      assert(next.second->unapplied_txns.empty());
+    {
+      pair<ghobject_t,OnodeRef> next;
+      while (c->onode_map.get_next(next.first, &next)) {
+	dout(10) << __func__ << " " << c->cid << " " << next.second->oid
+		 << " flush_txns " << next.second->flush_txns << dendl;
+	assert(!next.second->exists);
+	assert(next.second->flush_txns.empty());
+      }
     }
     c->onode_map.clear();
-    //c->onode_map.dump_weak_refs();
     dout(10) << __func__ << " " << c->cid << " done" << dendl;
   }
 }

@@ -61,18 +61,16 @@ public:
     bool dirty;     // ???
     bool exists;
 
-    Mutex wal_lock;  ///< protect unappliex_txns, num_fsyncs
-    Cond wal_cond;   ///< wait here for unapplied txns, fsyncs
-
-    //list<TransContextRef> uncommitted_txns; ///< pending txns
-    list<TransContext*> unapplied_txns;   ///< committed but unapplied txns
+    Mutex flush_lock;  ///< protect unappliex_txns, num_fsyncs
+    Cond flush_cond;   ///< wait here for unapplied txns, fsyncs
+    set<TransContext*> flush_txns;   ///< fsyncing or committing or wal txns
 
     Onode(const ghobject_t& o, const string& k);
 
-    void wait_wal() {
-      Mutex::Locker l(wal_lock);
-      while (!unapplied_txns.empty())
-	wal_cond.Wait(wal_lock);
+    void flush() {
+      Mutex::Locker l(flush_lock);
+      while (!flush_txns.empty())
+	flush_cond.Wait(flush_lock);
     }
   };
   typedef ceph::shared_ptr<Onode> OnodeRef;
@@ -140,7 +138,7 @@ public:
 
   struct TransContext {
     list<int> fds;             ///< these fds need to be synced
-    list<OnodeRef> onodes;     ///< these onodes need to be updated/written
+    set<OnodeRef> onodes;     ///< these onodes need to be updated/written
     KeyValueDB::Transaction t; ///< then we will commit this
     Context *oncommit;         ///< signal on commit
     list<CollectionRef> removed_collections; ///< colls we removed
@@ -154,16 +152,19 @@ public:
     TransContext()
       : wal_txn(NULL),
 	num_fsyncs_completed(0),
-	lock("NewStore::TransContext::lock") {}
+	lock("NewStore::TransContext::lock") {
+      cout << "txc new " << this << std::endl;
+    }
     ~TransContext() {
       delete wal_txn;
+      cout << "txc del " << this << std::endl;
     }
 
     void sync_fd(int f) {
       fds.push_back(f);
     }
     void write_onode(OnodeRef &o) {
-      onodes.push_back(o);
+      onodes.insert(o);
     }
 
     bool finish_fsync() {
@@ -179,25 +180,6 @@ public:
       Mutex::Locker l(lock);
       while (num_fsyncs_completed < fds.size())
 	cond.Wait(lock);
-    }
-
-    void mark_wal_onodes() {
-      for (list<OnodeRef>::iterator p = onodes.begin(); p != onodes.end(); ++p) {
-	Mutex::Locker l((*p)->wal_lock);
-	(*p)->unapplied_txns.push_back(this);
-      }
-    }
-    void finish_wal_apply() {
-      for (list<OnodeRef>::iterator p = onodes.begin(); p != onodes.end(); ++p) {
-	Mutex::Locker l((*p)->wal_lock);
-	assert((*p)->unapplied_txns.front() == this);
-	(*p)->unapplied_txns.pop_front();
-	if ((*p)->unapplied_txns.empty())
-	  (*p)->wal_cond.Signal();
-      }
-
-      // clear out refs
-      onodes.clear();
     }
   };
   typedef ceph::shared_ptr<TransContext> TransContextRef;
@@ -267,12 +249,22 @@ public:
       fd_queue.pop_front();
       return i;
     }
-    void _process(fsync_item *i, ThreadPool::TPHandle &handle);
+    void _process(fsync_item *i, ThreadPool::TPHandle &handle) {
+      store->_txc_process_fsync(i);
+    }
     void _clear() {
       while (!fd_queue.empty()) {
 	delete fd_queue.front();
 	fd_queue.pop_front();
       }
+    }
+
+    void flush() {
+      lock();
+      while (!fd_queue.empty())
+	_wait();
+      unlock();
+      drain();
     }
   };
 
@@ -312,7 +304,7 @@ private:
 
   KVSyncThread kv_sync_thread;
   Mutex kv_lock;
-  Cond kv_cond;
+  Cond kv_cond, kv_sync_cond;
   bool kv_stop;
   deque<TransContextRef> kv_queue, kv_committing;
 
@@ -351,8 +343,10 @@ private:
   TransContext *_txc_create(OpSequencer *osr);
   int _txc_finalize(OpSequencer *osr, TransContextRef& txc);
   void _txc_queue_fsync(TransContextRef& txc);
+  void _txc_process_fsync(fsync_item *i);
   void _txc_submit_kv(TransContextRef& txc);
-  void _txc_finish(TransContextRef txc);
+  void _txc_finish_kv(TransContextRef txc);
+  void _txc_finish_apply(TransContextRef txc);
 
   void _kv_sync_thread();
   void _kv_stop() {
@@ -380,6 +374,11 @@ public:
 
   int mount();
   int umount();
+
+  void sync(Context *onsync);
+  void sync();
+  void flush();
+  void sync_and_flush();
 
   unsigned get_max_object_name_length() {
     return 4096;
