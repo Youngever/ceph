@@ -343,7 +343,8 @@ NewStore::NewStore(CephContext *cct, const string& path)
     kv_lock("NewStore::kv_lock"),
     kv_stop(false),
     logger(NULL),
-    default_osr("default")
+    default_osr("default"),
+    reap_lock("NewStore::reap_lock")
 {
   _init_logger();
 }
@@ -693,6 +694,7 @@ int NewStore::umount()
   dout(1) << __func__ << dendl;
 
   sync_and_flush();
+  _reap_collections();
 
   dout(20) << __func__ << " stopping fsync_wq" << dendl;
   fsync_tp.stop();
@@ -767,6 +769,40 @@ NewStore::CollectionRef NewStore::_get_collection(coll_t cid)
   if (cp == coll_map.end())
     return CollectionRef();
   return cp->second;
+}
+
+void NewStore::_queue_reap_collection(CollectionRef& c)
+{
+  dout(10) << __func__ << " " << c->cid << dendl;
+  Mutex::Locker l(reap_lock);
+  removed_collections.push_back(c);
+}
+
+void NewStore::_reap_collections()
+{
+  Mutex::Locker l(reap_lock);
+  for (list<CollectionRef>::iterator p = removed_collections.begin();
+       p != removed_collections.end();
+       ++p) {
+    CollectionRef c = *p;
+    dout(10) << __func__ << " " << c->cid << dendl;
+    {
+      pair<ghobject_t,OnodeRef> next;
+      while (c->onode_map.get_next(next.first, &next)) {
+	assert(!next.second->exists);
+	if (!next.second->flush_txns.empty()) {
+	  dout(10) << __func__ << " " << c->cid << " " << next.second->oid
+		   << " flush_txns " << next.second->flush_txns << dendl;
+	  return;
+	}
+      }
+    }
+    c->onode_map.clear();
+    dout(10) << __func__ << " " << c->cid << " done" << dendl;
+  }
+
+  dout(10) << __func__ << " all reaped" << dendl;
+  reap_cond.Signal();
 }
 
 NewStore::Onode::Onode(const ghobject_t& o, const string& k)
@@ -1418,16 +1454,6 @@ struct C_ApplyWAL : public Context {
   }
 };
 
-struct C_FinishRemoveCollections : public Context {
-  NewStore *store;
-  NewStore::TransContextRef txc;
-  C_FinishRemoveCollections(NewStore *s, NewStore::TransContextRef t)
-    : store(s), txc(t) {}
-  void finish(int r) {
-    store->_finish_remove_collections(txc);
-  }
-};
-
 void NewStore::_txc_finish_kv(TransContextRef txc)
 {
   dout(20) << __func__ << " txc " << txc << dendl;
@@ -1464,9 +1490,9 @@ void NewStore::_txc_finish_apply(TransContextRef txc)
   // clear out refs
   txc->onodes.clear();
 
-  if (!txc->removed_collections.empty()) {
-    finisher.queue(new C_FinishRemoveCollections(this, txc));
-    //_finish_remove_collections(txc);
+  while (!txc->removed_collections.empty()) {
+    _queue_reap_collection(txc->removed_collections.front());
+    txc->removed_collections.pop_front();
   }
 }
 
@@ -1494,6 +1520,10 @@ void NewStore::_kv_sync_thread()
 	_txc_finish_kv(kv_committing.front());
 	kv_committing.pop_front();
       }
+
+      // this is as good a place as any ...
+      _reap_collections();
+
       kv_lock.Lock();
     }
   }
@@ -2497,29 +2527,6 @@ int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
  out:
   dout(10) << __func__ << " " << cid << " = " << r << dendl;
   return r;
-}
-
-void NewStore::_finish_remove_collections(TransContextRef& txc)
-{
-  dout(10) << __func__ << " txc " << txc << dendl;
-
-  for (list<CollectionRef>::iterator p = txc->removed_collections.begin();
-       p != txc->removed_collections.end();
-       ++p) {
-    CollectionRef c = *p;
-    dout(10) << __func__ << " " << c->cid << dendl;
-    {
-      pair<ghobject_t,OnodeRef> next;
-      while (c->onode_map.get_next(next.first, &next)) {
-	dout(10) << __func__ << " " << c->cid << " " << next.second->oid
-		 << " flush_txns " << next.second->flush_txns << dendl;
-	assert(!next.second->exists);
-	assert(next.second->flush_txns.empty());
-      }
-    }
-    c->onode_map.clear();
-    dout(10) << __func__ << " " << c->cid << " done" << dendl;
-  }
 }
 
 int NewStore::_split_collection(TransContextRef& txc,

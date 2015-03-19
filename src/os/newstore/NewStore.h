@@ -153,11 +153,11 @@ public:
       : wal_txn(NULL),
 	num_fsyncs_completed(0),
 	lock("NewStore::TransContext::lock") {
-      cout << "txc new " << this << std::endl;
+      //cout << "txc new " << this << std::endl;
     }
     ~TransContext() {
       delete wal_txn;
-      cout << "txc del " << this << std::endl;
+      //cout << "txc del " << this << std::endl;
     }
 
     void sync_fd(int f) {
@@ -312,6 +312,10 @@ private:
 
   Sequencer default_osr;
 
+  Mutex reap_lock;
+  Cond reap_cond;
+  list<CollectionRef> removed_collections;
+
 
   // --------------------------------------------------------
   // private methods
@@ -335,6 +339,8 @@ private:
   void _close_collections();
 
   CollectionRef _get_collection(coll_t cid);
+  void _queue_reap_collection(CollectionRef& c);
+  void _reap_collections();
 
   int _recover_next_fid();
   int _create_fid(fid_t *fid);
@@ -570,8 +576,6 @@ private:
 			CollectionRef& c,
 			CollectionRef& d,
 			unsigned bits, int rem);
-  void _finish_remove_collections(TransContextRef& txc);
-  friend class C_FinishRemoveCollections;
 
 };
 
