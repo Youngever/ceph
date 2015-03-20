@@ -29,6 +29,8 @@
 
 #include "newstore_types.h"
 
+#include "boost/intrusive/list.hpp"
+
 class NewStore : public ObjectStore {
   // -----------------------------------------------------
   // types
@@ -136,7 +138,45 @@ public:
     }
   };
 
+  class OpSequencer;
+
   struct TransContext {
+    typedef enum {
+      STATE_PREPARE,
+      STATE_FSYNC_QUEUED,
+      STATE_FSYNC_FSYNCING,
+      STATE_FSYNC_DONE,
+      STATE_KV_QUEUED,
+      STATE_KV_COMMITTING,
+      STATE_KV_DONE,
+      STATE_WAL_QUEUED,
+      STATE_WAL_APPLYING,
+      STATE_WAL_DONE,
+      STATE_DONE,
+    } state_t;
+
+    state_t state;
+
+    const char *get_state_name() {
+      switch (state) {
+      case STATE_PREPARE: return "prepare";
+      case STATE_FSYNC_QUEUED: return "fsync_queued";
+      case STATE_FSYNC_FSYNCING: return "fsync_fsyncing";
+      case STATE_FSYNC_DONE: return "fsync_done";
+      case STATE_KV_QUEUED: return "kv_queued";
+      case STATE_KV_COMMITTING: return "kv_committing";
+      case STATE_KV_DONE: return "kv_done";
+      case STATE_WAL_QUEUED: return "wal_queued";
+      case STATE_WAL_APPLYING: return "wal_applying";
+      case STATE_WAL_DONE: return "wal_done";
+      case STATE_DONE: return "done";
+      }
+      return "???";
+    }
+
+    OpSequencer *osr;
+    boost::intrusive::list_member_hook<> sequencer_item;
+
     list<int> fds;             ///< these fds need to be synced
     set<OnodeRef> onodes;     ///< these onodes need to be updated/written
     KeyValueDB::Transaction t; ///< then we will commit this
@@ -149,8 +189,10 @@ public:
     Mutex lock;
     Cond cond;
 
-    TransContext()
-      : wal_txn(NULL),
+    TransContext(OpSequencer *o)
+      : state(STATE_PREPARE),
+	osr(o),
+	wal_txn(NULL),
 	num_fsyncs_completed(0),
 	lock("NewStore::TransContext::lock") {
       //cout << "txc new " << this << std::endl;
@@ -182,14 +224,20 @@ public:
 	cond.Wait(lock);
     }
   };
-  typedef ceph::shared_ptr<TransContext> TransContextRef;
 
 
   class OpSequencer : public Sequencer_impl {
     Mutex qlock;
     Cond qcond;
-    list<TransContextRef> q;  ///< transactions
   public:
+    typedef boost::intrusive::list<
+      TransContext,
+      boost::intrusive::member_hook<
+        TransContext,
+	boost::intrusive::list_member_hook<>,
+	&TransContext::sequencer_item> > q_list_t;
+    q_list_t q;  ///< transactions
+
     Sequencer *parent;
 
     OpSequencer()
@@ -198,6 +246,23 @@ public:
     }
     ~OpSequencer() {
       assert(q.empty());
+    }
+
+    void queue_new(TransContext *txc) {
+      Mutex::Locker l(qlock);
+      q.push_back(*txc);
+    }
+
+    void reap_done() {
+      Mutex::Locker l(qlock);
+      while (!q.empty()) {
+	TransContext *txc = &q.front();
+	if (txc->state != TransContext::STATE_DONE)
+	  break;
+	q.pop_front();
+	delete txc;
+	qcond.Signal();
+      }
     }
 
     void flush() {
@@ -220,8 +285,8 @@ public:
 
   struct fsync_item {
     int fd;
-    TransContextRef txc;
-    fsync_item(int f, TransContextRef t) : fd(f), txc(t) {}
+    TransContext *txc;
+    fsync_item(int f, TransContext *t) : fd(f), txc(t) {}
   };
   class FsyncWQ : public ThreadPool::WorkQueue<fsync_item> {
     NewStore *store;
@@ -306,7 +371,7 @@ private:
   Mutex kv_lock;
   Cond kv_cond, kv_sync_cond;
   bool kv_stop;
-  deque<TransContextRef> kv_queue, kv_committing;
+  deque<TransContext*> kv_queue, kv_committing;
 
   Logger *logger;
 
@@ -347,12 +412,13 @@ private:
   int _open_fid(fid_t fid);
   int _remove_fid(fid_t fid);
   TransContext *_txc_create(OpSequencer *osr);
-  int _txc_finalize(OpSequencer *osr, TransContextRef& txc);
-  void _txc_queue_fsync(TransContextRef& txc);
+  int _txc_finalize(OpSequencer *osr, TransContext *txc);
+  void _txc_queue_fsync(TransContext *txc);
   void _txc_process_fsync(fsync_item *i);
-  void _txc_submit_kv(TransContextRef& txc);
-  void _txc_finish_kv(TransContextRef txc);
-  void _txc_finish_apply(TransContextRef txc);
+  void _txc_finish_fsync(TransContext *txc);
+  void _txc_submit_kv(TransContext *txc);
+  void _txc_finish_kv(TransContext *txc);
+  void _txc_finish_apply(TransContext *txc);
 
   void _kv_sync_thread();
   void _kv_stop() {
@@ -364,8 +430,8 @@ private:
     kv_sync_thread.join();
   }
 
-  wal_op_t *_get_wal_op(TransContextRef& txc);
-  int _apply_wal_transaction(TransContextRef& txc);
+  wal_op_t *_get_wal_op(TransContext *txc);
+  int _apply_wal_transaction(TransContext *txc);
   void _wait_object_wal(OnodeRef onode);
   friend class C_ApplyWAL;
 
@@ -510,69 +576,69 @@ private:
   // write ops
 
   int _do_transaction(Transaction *t,
-		      TransContextRef& txc,
+		      TransContext *txc,
 		      ThreadPool::TPHandle *handle);
 
-  int _write(TransContextRef& txc,
+  int _write(TransContext *txc,
 	     CollectionRef& c,
 	     const ghobject_t& oid,
 	     uint64_t offset, size_t len,
 	     const bufferlist& bl,
 	     uint32_t fadvise_flags);
-  int _do_write(TransContextRef txc,
+  int _do_write(TransContext *txc,
 		OnodeRef o,
 		uint64_t offset, uint64_t length,
 		const bufferlist& bl,
 		uint32_t fadvise_flags);
-  int _touch(TransContextRef& txc,
+  int _touch(TransContext *txc,
 	     CollectionRef& c,
 	     const ghobject_t& oid);
-  int _zero(TransContextRef& txc,
+  int _zero(TransContext *txc,
 	    CollectionRef& c,
 	    const ghobject_t& oid,
 	    uint64_t offset, size_t len);
-  int _truncate(TransContextRef& txc,
+  int _truncate(TransContext *txc,
 		CollectionRef& c,
 		const ghobject_t& oid,
 		uint64_t offset);
-  int _remove(TransContextRef& txc,
+  int _remove(TransContext *txc,
 	      CollectionRef& c,
 	      const ghobject_t& oid);
-  int _do_remove(TransContextRef& txc,
+  int _do_remove(TransContext *txc,
 		 OnodeRef o);
-  int _setattr(TransContextRef& txc,
+  int _setattr(TransContext *txc,
 	       CollectionRef& c,
 	       const ghobject_t& oid,
 	       const string& name,
 	       bufferptr& val);
-  int _setattrs(TransContextRef& txc,
+  int _setattrs(TransContext *txc,
 		CollectionRef& c,
 		const ghobject_t& oid,
 		const map<string,bufferptr>& aset);
-  int _rmattr(TransContextRef& txc,
+  int _rmattr(TransContext *txc,
 	      CollectionRef& c,
 	      const ghobject_t& oid,
 	      const string& name);
-  int _rmattrs(TransContextRef& txc,
+  int _rmattrs(TransContext *txc,
 	       CollectionRef& c,
 	       const ghobject_t& oid);
-  int _clone(TransContextRef& txc,
+  int _clone(TransContext *txc,
 	     CollectionRef& c,
 	     const ghobject_t& old_oid,
 	     const ghobject_t& new_oid);
-  int _clone_range(TransContextRef& txc,
+  int _clone_range(TransContext *txc,
 		   CollectionRef& c,
 		   const ghobject_t& old_oid,
 		   const ghobject_t& new_oid,
 		   uint64_t srcoff, uint64_t length, uint64_t dstoff);
-  int _rename(TransContextRef& txc,
+  int _rename(TransContext *txc,
 	      CollectionRef& c,
 	      const ghobject_t& old_oid,
 	      const ghobject_t& new_oid);
-  int _create_collection(TransContextRef& txc, coll_t cid, unsigned bits,
+  int _create_collection(TransContext *txc, coll_t cid, unsigned bits,
 			 CollectionRef *c);
-  int _remove_collection(TransContextRef& txc, coll_t cid, CollectionRef *c);
-  int _split_collection(TransContextRef& txc,
+  int _remove_collection(TransContext *txc, coll_t cid, CollectionRef *c);
+  int _split_collection(TransContext *txc,
 			CollectionRef& c,
 			CollectionRef& d,
 			unsigned bits, int rem);

@@ -1376,8 +1376,9 @@ int NewStore::_remove_fid(fid_t fid)
 
 NewStore::TransContext *NewStore::_txc_create(OpSequencer *osr)
 {
-  TransContext *txc = new TransContext;
+  TransContext *txc = new TransContext(osr);
   txc->t = db->get_transaction();
+  osr->queue_new(txc);
   dout(20) << __func__ << " osr " << osr << " = " << txc << dendl;
   return txc;
 }
@@ -1388,13 +1389,47 @@ void NewStore::_txc_process_fsync(fsync_item *i)
   int r = ::fdatasync(i->fd);
   assert(r == 0);
   if (i->txc->finish_fsync()) {
-    _txc_submit_kv(i->txc);
+    _txc_finish_fsync(i->txc);
   }
   dout(20) << __func__ << " txc " << i->txc << " done" << dendl;
   delete i;
 }
 
-int NewStore::_txc_finalize(OpSequencer *osr, TransContextRef& txc)
+void NewStore::_txc_finish_fsync(TransContext *txc)
+{
+  dout(20) << __func__ << " " << txc << dendl;
+  txc->state = TransContext::STATE_FSYNC_DONE;
+
+  /*
+   * we need to preserve the order of kv transactions,
+   * even though fsyncs will complete in any order.
+   */
+
+  OpSequencer *osr = txc->osr;
+
+  // fixme: take osr lock
+
+  OpSequencer::q_list_t::iterator p = osr->q.iterator_to(*txc);
+  while (p != osr->q.begin()) {
+    --p;
+    if (p->state < TransContext::STATE_FSYNC_DONE) {
+      dout(20) << __func__ << " " << txc << " blocked by " << &*p << " "
+	       << p->get_state_name() << dendl;
+      return;
+    }
+    if (p->state > TransContext::STATE_FSYNC_DONE) {
+      ++p;
+      break;
+    }
+  }
+  do {
+    _txc_submit_kv(&*p);
+    ++p;
+  } while (p != osr->q.end() &&
+	   p->state == TransContext::STATE_FSYNC_DONE);
+}
+
+int NewStore::_txc_finalize(OpSequencer *osr, TransContext *txc)
 {
   dout(20) << __func__ << " osr " << osr << " txc " << txc
 	   << " onodes " << txc->onodes << dendl;
@@ -1408,7 +1443,7 @@ int NewStore::_txc_finalize(OpSequencer *osr, TransContextRef& txc)
     txc->t->set(PREFIX_OBJ, (*p)->key, bl);
 
     Mutex::Locker l((*p)->flush_lock);
-    (*p)->flush_txns.insert(txc.get());
+    (*p)->flush_txns.insert(txc);
   }
 
   // journal wal items
@@ -1422,9 +1457,10 @@ int NewStore::_txc_finalize(OpSequencer *osr, TransContextRef& txc)
   return 0;
 }
 
-void NewStore::_txc_queue_fsync(TransContextRef& txc)
+void NewStore::_txc_queue_fsync(TransContext *txc)
 {
   dout(20) << __func__ << " txc " << txc << dendl;
+  txc->state = TransContext::STATE_FSYNC_QUEUED;
   fsync_wq.lock();
   for (list<int>::iterator p = txc->fds.begin();
        p != txc->fds.end();
@@ -1435,9 +1471,10 @@ void NewStore::_txc_queue_fsync(TransContextRef& txc)
   fsync_wq.unlock();
 }
 
-void NewStore::_txc_submit_kv(TransContextRef& txc)
+void NewStore::_txc_submit_kv(TransContext *txc)
 {
   dout(20) << __func__ << " txc " << txc << dendl;
+  txc->state = TransContext::STATE_KV_QUEUED;
 
   Mutex::Locker l(kv_lock);
   db->submit_transaction(txc->t);
@@ -1447,14 +1484,14 @@ void NewStore::_txc_submit_kv(TransContextRef& txc)
 
 struct C_ApplyWAL : public Context {
   NewStore *store;
-  NewStore::TransContextRef txc;
-  C_ApplyWAL(NewStore *s, NewStore::TransContextRef& t) : store(s), txc(t) {}
+  NewStore::TransContext *txc;
+  C_ApplyWAL(NewStore *s, NewStore::TransContext *t) : store(s), txc(t) {}
   void finish(int r) {
     store->_apply_wal_transaction(txc);
   }
 };
 
-void NewStore::_txc_finish_kv(TransContextRef txc)
+void NewStore::_txc_finish_kv(TransContext *txc)
 {
   dout(20) << __func__ << " txc " << txc << dendl;
 
@@ -1465,13 +1502,14 @@ void NewStore::_txc_finish_kv(TransContextRef txc)
 
   if (txc->wal_txn) {
     dout(20) << __func__ << " starting wal apply" << dendl;
+    txc->state = TransContext::STATE_WAL_QUEUED;
     finisher.queue(new C_ApplyWAL(this, txc));
   } else {
     _txc_finish_apply(txc);
   }
 }
 
-void NewStore::_txc_finish_apply(TransContextRef txc)
+void NewStore::_txc_finish_apply(TransContext *txc)
 {
   dout(20) << __func__ << " " << txc << " onodes " << txc->onodes << dendl;
 
@@ -1481,8 +1519,8 @@ void NewStore::_txc_finish_apply(TransContextRef txc)
     Mutex::Locker l((*p)->flush_lock);
     dout(20) << __func__ << " onode " << *p << " had " << (*p)->flush_txns
 	     << dendl;
-    assert((*p)->flush_txns.count(txc.get()));
-    (*p)->flush_txns.erase(txc.get());
+    assert((*p)->flush_txns.count(txc));
+    (*p)->flush_txns.erase(txc);
     if ((*p)->flush_txns.empty())
       (*p)->flush_cond.Signal();
   }
@@ -1494,6 +1532,10 @@ void NewStore::_txc_finish_apply(TransContextRef txc)
     _queue_reap_collection(txc->removed_collections.front());
     txc->removed_collections.pop_front();
   }
+
+  OpSequencer *osr = txc->osr;
+  txc->state = TransContext::STATE_DONE;
+  osr->reap_done();
 }
 
 
@@ -1513,9 +1555,13 @@ void NewStore::_kv_sync_thread()
     } else {
       dout(20) << __func__ << " committing " << kv_queue.size() << dendl;
       kv_committing.swap(kv_queue);
+      utime_t start = ceph_clock_now(NULL);
       kv_lock.Unlock();
       db->submit_transaction_sync(db->get_transaction());
-      dout(20) << __func__ << " committed " << kv_queue.size() << dendl;
+      utime_t finish = ceph_clock_now(NULL);
+      utime_t dur = finish - start;
+      dout(20) << __func__ << " committed " << kv_committing.size()
+	       << " in " << dur << dendl;
       while (!kv_committing.empty()) {
 	_txc_finish_kv(kv_committing.front());
 	kv_committing.pop_front();
@@ -1531,7 +1577,7 @@ void NewStore::_kv_sync_thread()
   dout(10) << __func__ << " finish" << dendl;
 }
 
-wal_op_t *NewStore::_get_wal_op(TransContextRef& txc)
+wal_op_t *NewStore::_get_wal_op(TransContext *txc)
 {
   if (!txc->wal_txn) {
     txc->wal_txn = new wal_transaction_t;
@@ -1540,10 +1586,11 @@ wal_op_t *NewStore::_get_wal_op(TransContextRef& txc)
   return &txc->wal_txn->ops.back();
 }
 
-int NewStore::_apply_wal_transaction(TransContextRef& txc)
+int NewStore::_apply_wal_transaction(TransContext *txc)
 {
   wal_transaction_t& wt = *txc->wal_txn;
   dout(20) << __func__ << " txc " << txc << " seq " << wt.seq << dendl;
+  txc->state = TransContext::STATE_WAL_APPLYING;
 
   vector<int> sync_fds;
   sync_fds.reserve(wt.ops.size());
@@ -1637,7 +1684,7 @@ int NewStore::queue_transactions(
     dout(5) << __func__ << " new " << *osr << "/" << osr->parent << dendl;
   }
 
-  TransContextRef txc(_txc_create(osr));
+  TransContext *txc = _txc_create(osr);
 
   // XXX do it sync for now; this is not crash safe
   for (list<Transaction*>::iterator p = tls.begin(); p != tls.end(); ++p) {
@@ -1659,6 +1706,7 @@ int NewStore::queue_transactions(
     // do it syncrhonously.  for example, if we have a *very* fast backend.
 
     // sync
+    txc->state = TransContext::STATE_FSYNC_FSYNCING;
     for (list<int>::iterator p = txc->fds.begin(); p != txc->fds.end(); ++p) {
       dout(30) << __func__ << " fsync " << *p << dendl;
       int r = ::fsync(*p);
@@ -1669,16 +1717,16 @@ int NewStore::queue_transactions(
       }
     }
 
+    txc->state = TransContext::STATE_KV_COMMITTING;
     db->submit_transaction_sync(txc->t);
 
     _txc_finish_kv(txc);
   } else {
     // async path
-
     if (!txc->fds.empty()) {
       _txc_queue_fsync(txc);
     } else {
-      _txc_submit_kv(txc);
+      _txc_finish_fsync(txc);
     }
   }
 
@@ -1686,7 +1734,7 @@ int NewStore::queue_transactions(
 }
 
 int NewStore::_do_transaction(Transaction *t,
-			      TransContextRef& txc,
+			      TransContext *txc,
 			      ThreadPool::TPHandle *handle)
 {
   Transaction::iterator i = t->begin();
@@ -2012,7 +2060,7 @@ int NewStore::_do_transaction(Transaction *t,
 // -----------------
 // write operations
 
-int NewStore::_touch(TransContextRef& txc,
+int NewStore::_touch(TransContext *txc,
 		     CollectionRef& c,
 		     const ghobject_t& oid)
 {
@@ -2027,7 +2075,7 @@ int NewStore::_touch(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_do_write(TransContextRef txc,
+int NewStore::_do_write(TransContext *txc,
 			OnodeRef o,
 			uint64_t offset, uint64_t length,
 			const bufferlist& bl,
@@ -2099,7 +2147,7 @@ int NewStore::_do_write(TransContextRef txc,
 }
 
 
-int NewStore::_write(TransContextRef& txc,
+int NewStore::_write(TransContext *txc,
 		     CollectionRef& c,
 		     const ghobject_t& oid,
 		     uint64_t offset, size_t length,
@@ -2120,7 +2168,7 @@ int NewStore::_write(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_zero(TransContextRef& txc,
+int NewStore::_zero(TransContext *txc,
 		    CollectionRef& c,
 		    const ghobject_t& oid,
 		    uint64_t offset, size_t length)
@@ -2138,7 +2186,7 @@ int NewStore::_zero(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_truncate(TransContextRef& txc,
+int NewStore::_truncate(TransContext *txc,
 			CollectionRef& c,
 			const ghobject_t& oid,
 			uint64_t offset)
@@ -2185,7 +2233,7 @@ int NewStore::_truncate(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_do_remove(TransContextRef& txc,
+int NewStore::_do_remove(TransContext *txc,
 			 OnodeRef o)
 {
   string key;
@@ -2208,7 +2256,7 @@ int NewStore::_do_remove(TransContextRef& txc,
   return 0;
 }
 
-int NewStore::_remove(TransContextRef& txc,
+int NewStore::_remove(TransContext *txc,
 		      CollectionRef& c,
 		      const ghobject_t& oid)
 {
@@ -2227,7 +2275,7 @@ int NewStore::_remove(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_setattr(TransContextRef& txc,
+int NewStore::_setattr(TransContext *txc,
 		       CollectionRef& c,
 		       const ghobject_t& oid,
 		       const string& name,
@@ -2255,7 +2303,7 @@ int NewStore::_setattr(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_setattrs(TransContextRef& txc,
+int NewStore::_setattrs(TransContext *txc,
 			CollectionRef& c,
 			const ghobject_t& oid,
 			const map<string,bufferptr>& aset)
@@ -2285,7 +2333,7 @@ int NewStore::_setattrs(TransContextRef& txc,
 }
 
 
-int NewStore::_rmattr(TransContextRef& txc,
+int NewStore::_rmattr(TransContext *txc,
 		      CollectionRef& c,
 		      const ghobject_t& oid,
 		      const string& name)
@@ -2310,7 +2358,7 @@ int NewStore::_rmattr(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_rmattrs(TransContextRef& txc,
+int NewStore::_rmattrs(TransContext *txc,
 		       CollectionRef& c,
 		       const ghobject_t& oid)
 {
@@ -2332,7 +2380,7 @@ int NewStore::_rmattrs(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_clone(TransContextRef& txc,
+int NewStore::_clone(TransContext *txc,
 		     CollectionRef& c,
 		     const ghobject_t& old_oid,
 		     const ghobject_t& new_oid)
@@ -2380,7 +2428,7 @@ int NewStore::_clone(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_clone_range(TransContextRef& txc,
+int NewStore::_clone_range(TransContext *txc,
 			   CollectionRef& c,
 			   const ghobject_t& old_oid,
 			   const ghobject_t& new_oid,
@@ -2421,7 +2469,7 @@ int NewStore::_clone_range(TransContextRef& txc,
   return r;
 }
 
-int NewStore::_rename(TransContextRef& txc,
+int NewStore::_rename(TransContext *txc,
 		      CollectionRef& c,
 		      const ghobject_t& old_oid,
 		      const ghobject_t& new_oid)
@@ -2469,7 +2517,7 @@ int NewStore::_rename(TransContextRef& txc,
 // collections
 
 int NewStore::_create_collection(
-  TransContextRef& txc,
+  TransContext *txc,
   coll_t cid,
   unsigned bits,
   CollectionRef *c)
@@ -2497,7 +2545,7 @@ int NewStore::_create_collection(
   return r;
 }
 
-int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
+int NewStore::_remove_collection(TransContext *txc, coll_t cid,
 				 CollectionRef *c)
 {
   dout(15) << __func__ << " " << cid << dendl;
@@ -2529,7 +2577,7 @@ int NewStore::_remove_collection(TransContextRef& txc, coll_t cid,
   return r;
 }
 
-int NewStore::_split_collection(TransContextRef& txc,
+int NewStore::_split_collection(TransContext *txc,
 				CollectionRef& c,
 				CollectionRef& d,
 				unsigned bits, int rem)
