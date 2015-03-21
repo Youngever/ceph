@@ -2127,12 +2127,13 @@ int NewStore::_do_write(TransContext *txc,
   o->exists = true;
 
   if (o->onode.size == offset ||
-      o->onode.size == 0) {
+      o->onode.size == 0 ||
+      o->onode.data_map.empty()) {
     if (o->onode.data_map.empty()) {
       // create
       fragment_t &f = o->onode.data_map[0];
       f.offset = 0;
-      f.length = offset + length;
+      f.length = MAX(offset + length, o->onode.size);
       fd = _create_fid(&f.fid);
       if (fd < 0) {
 	r = fd;
@@ -2238,7 +2239,9 @@ int NewStore::_truncate(TransContext *txc,
     r = -ENOENT;
     goto out;
   }
-  if (offset == 0) {
+  if (o->onode.data_map.empty()) {
+    o->onode.size = offset;
+  } else if (offset == 0) {
     while (!o->onode.data_map.empty()) {
       wal_op_t *op = _get_wal_op(txc);
       op->op = wal_op_t::OP_REMOVE;
@@ -2258,6 +2261,7 @@ int NewStore::_truncate(TransContext *txc,
     // resize file up.  make sure we don't have trailing
     // garbage!
     // FIXME !!
+    assert(0);
   }
   o->onode.size = offset;
   txc->write_onode(o);
