@@ -29,12 +29,12 @@
 
   TODO:
 
-  * async queue_transaction
-  * prealloc fids
   * sequencer flush machinery
+  * sequencer op ordering
+  * prealloc fids
   * omap
   * hobject sorting
-  * sequencer op ordering
+  * use intrusive for fsync queue
 
  */
 
@@ -525,7 +525,7 @@ int NewStore::_open_db()
   char fn[PATH_MAX];
   snprintf(fn, sizeof(fn), "%s/db", path.c_str());
   db = KeyValueDB::create(g_ceph_context,
-			  g_conf->newstore_backend /* fixme */,
+			  g_conf->newstore_backend,
 			  fn);
   if (!db) {
     derr << __func__ << " error creating db" << dendl;
@@ -1398,7 +1398,6 @@ void NewStore::_txc_process_fsync(fsync_item *i)
 void NewStore::_txc_finish_fsync(TransContext *txc)
 {
   dout(20) << __func__ << " " << txc << dendl;
-  txc->state = TransContext::STATE_FSYNC_DONE;
 
   /*
    * we need to preserve the order of kv transactions,
@@ -1406,8 +1405,8 @@ void NewStore::_txc_finish_fsync(TransContext *txc)
    */
 
   OpSequencer *osr = txc->osr;
-
-  // fixme: take osr lock
+  Mutex::Locker l(osr->qlock);
+  txc->state = TransContext::STATE_FSYNC_DONE;
 
   OpSequencer::q_list_t::iterator p = osr->q.iterator_to(*txc);
   while (p != osr->q.begin()) {
@@ -1423,8 +1422,7 @@ void NewStore::_txc_finish_fsync(TransContext *txc)
     }
   }
   do {
-    _txc_submit_kv(&*p);
-    ++p;
+    _txc_submit_kv(&*p++);
   } while (p != osr->q.end() &&
 	   p->state == TransContext::STATE_FSYNC_DONE);
 }
@@ -1494,17 +1492,31 @@ struct C_ApplyWAL : public Context {
 void NewStore::_txc_finish_kv(TransContext *txc)
 {
   dout(20) << __func__ << " txc " << txc << dendl;
+  txc->osr->qlock.Lock();
+  txc->state = TransContext::STATE_KV_DONE;
 
-  if (txc->oncommit) {
-    txc->oncommit->complete(0);
-    txc->oncommit = NULL;
-  }
+  // loop in case we race with OpSequencer::flush_commit()
+  do {
+    txc->osr->qlock.Unlock();
+    if (txc->oncommit) {
+      txc->oncommit->complete(0);
+      txc->oncommit = NULL;
+    }
+    while (!txc->oncommits.empty()) {
+      txc->oncommits.front()->complete(0);
+      txc->oncommits.pop_front();
+    }
+    txc->osr->qlock.Lock();
+  } while (txc->oncommit || !txc->oncommits.empty());
 
   if (txc->wal_txn) {
     dout(20) << __func__ << " starting wal apply" << dendl;
     txc->state = TransContext::STATE_WAL_QUEUED;
+    txc->osr->qlock.Unlock();
     finisher.queue(new C_ApplyWAL(this, txc));
   } else {
+    txc->state = TransContext::STATE_FINISHING;
+    txc->osr->qlock.Unlock();
     _txc_finish_apply(txc);
   }
 }
@@ -1512,6 +1524,7 @@ void NewStore::_txc_finish_kv(TransContext *txc)
 void NewStore::_txc_finish_apply(TransContext *txc)
 {
   dout(20) << __func__ << " " << txc << " onodes " << txc->onodes << dendl;
+  assert(txc->state == TransContext::STATE_FINISHING);
 
   for (set<OnodeRef>::iterator p = txc->onodes.begin();
        p != txc->onodes.end();
@@ -1534,10 +1547,29 @@ void NewStore::_txc_finish_apply(TransContext *txc)
   }
 
   OpSequencer *osr = txc->osr;
+  osr->qlock.Lock();
   txc->state = TransContext::STATE_DONE;
-  osr->reap_done();
+  osr->qlock.Unlock();
+
+  _osr_reap_done(osr);
 }
 
+void NewStore::_osr_reap_done(OpSequencer *osr)
+{
+  Mutex::Locker l(osr->qlock);
+  dout(20) << __func__ << " osr " << osr << dendl;
+  while (!osr->q.empty()) {
+    TransContext *txc = &osr->q.front();
+    dout(20) << __func__ << "  txc " << txc << " " << txc->get_state_name()
+	     << dendl;
+    if (txc->state != TransContext::STATE_DONE) {
+      break;
+    }
+    osr->q.pop_front();
+    delete txc;
+    osr->qcond.Signal();
+  }
+}
 
 void NewStore::_kv_sync_thread()
 {
@@ -1649,6 +1681,10 @@ int NewStore::_apply_wal_transaction(TransContext *txc)
     assert(r == 0);
     VOID_TEMP_FAILURE_RETRY(::close(*p));
   }
+
+  txc->osr->qlock.Lock();
+  txc->state = TransContext::STATE_FINISHING;
+  txc->osr->qlock.Unlock();
 
   _txc_finish_apply(txc);
   return 0;

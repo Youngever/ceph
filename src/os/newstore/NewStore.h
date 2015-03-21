@@ -152,6 +152,7 @@ public:
       STATE_WAL_QUEUED,
       STATE_WAL_APPLYING,
       STATE_WAL_DONE,
+      STATE_FINISHING,
       STATE_DONE,
     } state_t;
 
@@ -169,6 +170,7 @@ public:
       case STATE_WAL_QUEUED: return "wal_queued";
       case STATE_WAL_APPLYING: return "wal_applying";
       case STATE_WAL_DONE: return "wal_done";
+      case STATE_FINISHING: return "finishing";
       case STATE_DONE: return "done";
       }
       return "???";
@@ -181,6 +183,7 @@ public:
     set<OnodeRef> onodes;     ///< these onodes need to be updated/written
     KeyValueDB::Transaction t; ///< then we will commit this
     Context *oncommit;         ///< signal on commit
+    list<Context*> oncommits;  ///< more commit completions
     list<CollectionRef> removed_collections; ///< colls we removed
 
     wal_transaction_t *wal_txn; ///< wal transaction (if any)
@@ -227,9 +230,9 @@ public:
 
 
   class OpSequencer : public Sequencer_impl {
+  public:
     Mutex qlock;
     Cond qcond;
-  public:
     typedef boost::intrusive::list<
       TransContext,
       boost::intrusive::member_hook<
@@ -253,18 +256,6 @@ public:
       q.push_back(*txc);
     }
 
-    void reap_done() {
-      Mutex::Locker l(qlock);
-      while (!q.empty()) {
-	TransContext *txc = &q.front();
-	if (txc->state != TransContext::STATE_DONE)
-	  break;
-	q.pop_front();
-	delete txc;
-	qcond.Signal();
-      }
-    }
-
     void flush() {
       Mutex::Locker l(qlock);
       while (!q.empty())
@@ -277,8 +268,13 @@ public:
 	delete c;
 	return true;
       }
-      //q.back()->oncommit.push_back(c); /// XXX onreadable?
-#warning fixme
+      TransContext *txc = &q.back();
+      if (txc->state > TransContext::STATE_KV_DONE) {
+	delete c;
+	return true;
+      }
+      assert(txc->state <= TransContext::STATE_KV_DONE);
+      txc->oncommits.push_back(c);
       return false;
     }
   };
@@ -411,6 +407,7 @@ private:
   int _create_fid(fid_t *fid);
   int _open_fid(fid_t fid);
   int _remove_fid(fid_t fid);
+
   TransContext *_txc_create(OpSequencer *osr);
   int _txc_finalize(OpSequencer *osr, TransContext *txc);
   void _txc_queue_fsync(TransContext *txc);
@@ -419,6 +416,8 @@ private:
   void _txc_submit_kv(TransContext *txc);
   void _txc_finish_kv(TransContext *txc);
   void _txc_finish_apply(TransContext *txc);
+
+  void _osr_reap_done(OpSequencer *osr);
 
   void _kv_sync_thread();
   void _kv_stop() {
