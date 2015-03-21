@@ -35,6 +35,9 @@
   * omap
   * hobject sorting
   * use intrusive for fsync queue
+  * rename: we need to fix shared_cache to allow rename (Cleanup class has a
+    copy of hte original key), OR we need to avoid chaining state to the Onode
+    it references.  meh!
 
  */
 
