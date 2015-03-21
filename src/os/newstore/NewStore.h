@@ -408,6 +408,8 @@ private:
   int _open_fid(fid_t fid);
   int _remove_fid(fid_t fid);
 
+  int _clean_fid_tail(TransContext *txc, const fragment_t& f);
+
   TransContext *_txc_create(OpSequencer *osr);
   int _txc_finalize(OpSequencer *osr, TransContext *txc);
   void _txc_queue_fsync(TransContext *txc);

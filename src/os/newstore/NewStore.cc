@@ -2146,12 +2146,13 @@ int NewStore::_do_write(TransContext *txc,
       // append (possibly with gap)
       assert(o->onode.data_map.size() == 1);
       fragment_t &f = o->onode.data_map.rbegin()->second;
-      f.length = (offset + length) - f.offset;
       fd = _open_fid(f.fid);
       if (fd < 0) {
 	r = fd;
 	goto out;
       }
+      ::ftruncate(fd, f.length);  // in case there is trailing crap
+      f.length = (offset + length) - f.offset;
       ::lseek64(fd, offset - f.offset, SEEK_SET);
       dout(20) << __func__ << " append " << f.fid << " writing "
 	       << (offset - f.offset) << "~" << length << dendl;
@@ -2166,6 +2167,9 @@ int NewStore::_do_write(TransContext *txc,
     assert(o->onode.data_map.size() == 1);
     const fragment_t& f = o->onode.data_map.begin()->second;
     assert(f.offset == 0);
+    r = _clean_fid_tail(txc, f);
+    if (r < 0)
+      goto out;
     wal_op_t *op = _get_wal_op(txc);
     op->op = wal_op_t::OP_WRITE;
     op->offset = offset - f.offset;
@@ -2181,6 +2185,37 @@ int NewStore::_do_write(TransContext *txc,
 
  out:
   return r;
+}
+
+int NewStore::_clean_fid_tail(TransContext *txc, const fragment_t& f)
+{
+  int fd = _open_fid(f.fid);
+  if (fd < 0) {
+    return fd;
+  }
+  struct stat st;
+  int r = ::fstat(fd, &st);
+  if (r < 0) {
+    r = -errno;
+    derr << __func__ << " failed to fstat " << f.fid << ": "
+	 << cpp_strerror(r) << dendl;
+    return r;
+  }
+  if (st.st_size > f.length) {
+    dout(20) << __func__ << " frag " << f.fid << " is long, truncating"
+	     << dendl;
+    r = ::ftruncate(fd, f.length);
+    if (r < 0) {
+      derr << __func__ << " failed to ftruncate " << f.fid << ": "
+	   << cpp_strerror(r) << dendl;
+      return r;
+    }
+    txc->sync_fd(fd);
+  } else {
+    // all good!
+    VOID_TEMP_FAILURE_RETRY(::close(path_fd));
+  }
+  return 0;
 }
 
 
@@ -2258,10 +2293,12 @@ int NewStore::_truncate(TransContext *txc,
     assert(f.offset == 0);
     f.length = offset;
   } else if (offset > o->onode.size) {
-    // resize file up.  make sure we don't have trailing
-    // garbage!
-    // FIXME !!
-    assert(0);
+    // resize file up.  make sure we don't have trailing bytes
+    assert(o->onode.data_map.size() == 1);
+    fragment_t& f = o->onode.data_map.begin()->second;
+    r = _clean_fid_tail(txc, f);
+    if (r < 0)
+      goto out;
   }
   o->onode.size = offset;
   txc->write_onode(o);
