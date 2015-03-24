@@ -31,10 +31,12 @@
 
   TODO:
 
+  * omap
+  * lru trimming
+  * lru get_next more efficient (intrusive_ptr?)
   * sequencer flush machinery
   * sequencer op ordering
   * prealloc fids
-  * omap
   * hobject sorting
   * use intrusive for fsync queue
   * rename: we need to fix shared_cache to allow rename (Cleanup class has a
@@ -49,7 +51,6 @@
       - DBObjectMap::clone lock ordering
       - HashIndex::get_path_contents_by_hash
       - HashIndex::list_by_hash
-  * sequencer op ordering
 
  */
 
@@ -62,8 +63,9 @@ const string PREFIX_WAL = "L";  // write ahead log
  * key
  *
  * The key string needs to lexicographically sort the same way that
- * ghobject_t does.  We do this by escaping anything <= to '%' or >
- * 126 with % plus the 2 digit hex string.
+ * ghobject_t does.  We do this by escaping anything <= to '%' with %
+ * plus a 2 digit hex string, and anything >= '~' with ~ plus the two
+ * hex digits.
  *
  * We use ! as a separator for strings; this works because it is < %
  * and will get escaped if it is present in the string.
@@ -86,8 +88,11 @@ static void append_escaped(const string &in, string *out)
 {
   char hexbyte[8];
   for (string::const_iterator i = in.begin(); i != in.end(); ++i) {
-    if (*i <= '%' || *i > 126) {
+    if (*i <= '%') {
       snprintf(hexbyte, sizeof(hexbyte), "%%%02x", (unsigned)*i);
+      out->append(hexbyte);
+    } else if (*i >= 126) {
+      snprintf(hexbyte, sizeof(hexbyte), "~%02x", (unsigned)*i);
       out->append(hexbyte);
     } else {
       out->push_back(*i);
@@ -99,7 +104,7 @@ static int decode_escaped(const char *p, string *out)
 {
   const char *orig_p = p;
   while (*p && *p != '!') {
-    if (*p == '%') {
+    if (*p == '%' || *p == '~') {
       unsigned hex;
       int r = sscanf(++p, "%2x", &hex);
       if (r < 1)
