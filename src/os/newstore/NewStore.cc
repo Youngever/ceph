@@ -38,6 +38,16 @@
   * rename: we need to fix shared_cache to allow rename (Cleanup class has a
     copy of hte original key), OR we need to avoid chaining state to the Onode
     it references.  meh!
+      - backfill
+      - scrub
+      - pgnls
+      - tiering agent position
+      - ObjectStore::collection_list_range
+      - ObjectStore::collection_list_partial
+      - DBObjectMap::clone lock ordering
+      - HashIndex::get_path_contents_by_hash
+      - HashIndex::list_by_hash
+  * sequencer op ordering
 
  */
 
