@@ -25,6 +25,8 @@
 #include "common/errno.h"
 #include "common/safe_io.h"
 
+#define dout_subsys ceph_subsys_newstore
+
 /*
 
   TODO:
@@ -262,9 +264,127 @@ static int get_key_object(const string& key, ghobject_t *oid)
 }
 
 
+// Onode
+
+NewStore::Onode::Onode(const ghobject_t& o, const string& k)
+  : oid(o),
+    key(k),
+    dirty(false),
+    exists(true),
+    flush_lock("NewStore::Onode::flush_lock") {
+}
+
+// OnodeHashLRU
+
+#undef dout_prefix
+#define dout_prefix *_dout << "newstore.lru(" << this << ") "
+
+void NewStore::OnodeHashLRU::_touch(OnodeRef o)
+{
+  lru_list_t::iterator p = lru.iterator_to(*o);
+  lru.erase(p);
+  lru.push_front(*o);
+}
+
+void NewStore::OnodeHashLRU::add(const ghobject_t& oid, OnodeRef o)
+{
+  Mutex::Locker l(lock);
+  dout(30) << __func__ << " " << oid << " " << o << dendl;
+  assert(onode_map.count(oid) == 0);
+  onode_map[oid] = o;
+  lru.push_back(*o);
+}
+
+NewStore::OnodeRef NewStore::OnodeHashLRU::lookup(const ghobject_t& oid)
+{
+  Mutex::Locker l(lock);
+  dout(30) << __func__ << dendl;
+  ceph::unordered_map<ghobject_t,OnodeRef>::iterator p = onode_map.find(oid);
+  if (p == onode_map.end()) {
+    dout(30) << __func__ << " " << oid << " miss" << dendl;
+    return OnodeRef();
+  }
+  dout(30) << __func__ << " " << oid << " hit " << p->second << dendl;
+  _touch(p->second);
+  return p->second;
+}
+
+void NewStore::OnodeHashLRU::clear()
+{
+  Mutex::Locker l(lock);
+  dout(10) << __func__ << dendl;
+  lru.clear();
+  onode_map.clear();
+}
+
+void NewStore::OnodeHashLRU::remove(const ghobject_t& oid)
+{
+  Mutex::Locker l(lock);
+  ceph::unordered_map<ghobject_t,OnodeRef>::iterator p = onode_map.find(oid);
+  if (p == onode_map.end()) {
+    dout(30) << __func__ << " " << oid << " miss" << dendl;
+    return;
+  }
+  dout(30) << __func__ << " " << oid << " hit " << p->second << dendl;
+  lru_list_t::iterator pi = lru.iterator_to(*p->second);
+  lru.erase(pi);
+  onode_map.erase(p);
+}
+
+void NewStore::OnodeHashLRU::rename(const ghobject_t& old_oid,
+				    const ghobject_t& new_oid)
+{
+  Mutex::Locker l(lock);
+  dout(30) << __func__ << " " << old_oid << " -> " << new_oid << dendl;
+  ceph::unordered_map<ghobject_t,OnodeRef>::iterator po, pn;
+  po = onode_map.find(old_oid);
+  pn = onode_map.find(new_oid);
+
+  assert(po != onode_map.end());
+  if (pn != onode_map.end()) {
+    lru_list_t::iterator p = lru.iterator_to(*pn->second);
+    lru.erase(p);
+    onode_map.erase(pn);
+  }
+  onode_map.insert(make_pair(new_oid, po->second));
+  _touch(po->second);
+  onode_map.erase(po);
+}
+
+bool NewStore::OnodeHashLRU::get_next(
+  const ghobject_t& after,
+  pair<ghobject_t,OnodeRef> *next)
+{
+  Mutex::Locker l(lock);
+  dout(20) << __func__ << " after " << after << dendl;
+
+  if (after == ghobject_t()) {
+    if (lru.empty()) {
+      return false;
+    }
+    ceph::unordered_map<ghobject_t,OnodeRef>::iterator p = onode_map.begin();
+    assert(p != onode_map.end());
+    next->first = p->first;
+    next->second = p->second;
+    return true;
+  }
+
+  ceph::unordered_map<ghobject_t,OnodeRef>::iterator p = onode_map.find(after);
+  assert(p != onode_map.end()); // for now
+  lru_list_t::iterator pi = lru.iterator_to(*p->second);
+  ++pi;
+  if (pi == lru.end()) {
+    return false;
+  }
+  next->first = pi->oid;
+  next->second = onode_map[pi->oid];
+  return true;
+}
+
 // =======================================================
 
-#define dout_subsys ceph_subsys_newstore
+// Collection
+
 #undef dout_prefix
 #define dout_prefix *_dout << "newstore(" << store->path << ").collection(" << cid << ") "
 
@@ -272,7 +392,8 @@ NewStore::Collection::Collection(NewStore *ns, coll_t c)
   : store(ns),
     cid(c),
     lock("NewStore::Collection::lock"),
-    onode_map(store->cct, store->cct->_conf->newstore_onode_map_size)
+    onode_map() //store->cct, store->cct->_conf->newstore_onode_map_size)
+#warning fixme
 {
 }
 
@@ -318,8 +439,9 @@ NewStore::OnodeRef NewStore::Collection::get_onode(
     bufferlist::iterator p = v.begin();
     ::decode(on->onode, p);
   }
-
-  return onode_map.add(oid, on, NULL);
+  o.reset(on);
+  onode_map.add(oid, o);
+  return o;
 }
 
 
@@ -817,16 +939,6 @@ void NewStore::_reap_collections()
   dout(10) << __func__ << " all reaped" << dendl;
   reap_cond.Signal();
 }
-
-NewStore::Onode::Onode(const ghobject_t& o, const string& k)
-  : oid(o),
-    key(k),
-    dirty(false),
-    exists(true),
-    flush_lock("NewStore::Onode::flush_lock") {
-}
-
-
 
 // ---------------
 // read operations
@@ -2586,15 +2698,14 @@ int NewStore::_rename(TransContext *txc,
       return r;
   }
 
-  assert(0 == "write me");
-  /*
   get_object_key(old_oid, NULL);
   get_object_key(new_oid, &new_key);
-  //c->onode_map.add(new_key, oldo, NULL);
-  //c->onode_map.remove(old_key, oldo);
+
+  c->onode_map.rename(old_oid, new_oid);
   oldo->oid = new_oid;
   oldo->key = new_key;
-  */
+
+  txc->t->rmkey(PREFIX_OBJ, old_key);
   txc->write_onode(oldo);
   r = 0;
 

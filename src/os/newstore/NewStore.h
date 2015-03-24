@@ -22,7 +22,6 @@
 #include "include/memory.h"
 #include "common/Finisher.h"
 #include "common/RWLock.h"
-#include "common/shared_cache.hpp"
 #include "common/WorkQueue.h"
 #include "os/ObjectStore.h"
 #include "os/KeyValueDB.h"
@@ -59,6 +58,8 @@ public:
   struct Onode {
     ghobject_t oid;
     string key;     ///< key under PREFIX_OBJ where we are stored
+    boost::intrusive::list_member_hook<> lru_item;
+
     onode_t onode;  ///< metadata stored as value in kv store
     bool dirty;     // ???
     bool exists;
@@ -77,6 +78,29 @@ public:
   };
   typedef ceph::shared_ptr<Onode> OnodeRef;
 
+  struct OnodeHashLRU {
+    typedef boost::intrusive::list<
+      Onode,
+      boost::intrusive::member_hook<
+        Onode,
+	boost::intrusive::list_member_hook<>,
+	&Onode::lru_item> > lru_list_t;
+
+    Mutex lock;
+    ceph::unordered_map<ghobject_t,OnodeRef> onode_map;  ///< forward lookups
+    lru_list_t lru;                                      ///< lru
+
+    OnodeHashLRU() : lock("NewStore::OnodeHashLRU::lock") {}
+
+    void add(const ghobject_t& oid, OnodeRef o);
+    void _touch(OnodeRef o);
+    OnodeRef lookup(const ghobject_t& o);
+    void remove(const ghobject_t& o);
+    void rename(const ghobject_t& old_oid, const ghobject_t& new_oid);
+    void clear();
+    bool get_next(const ghobject_t& after, pair<ghobject_t,OnodeRef> *next);
+  };
+
   struct Collection {
     NewStore *store;
     coll_t cid;
@@ -85,7 +109,7 @@ public:
 
     // cache onodes on a per-collection basis to avoid lock
     // contention.
-    SharedLRU<ghobject_t,Onode> onode_map;
+    OnodeHashLRU onode_map;
 
     OnodeRef get_onode(const ghobject_t& oid, bool create);
 
