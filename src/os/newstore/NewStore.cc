@@ -51,6 +51,7 @@
       - DBObjectMap::clone lock ordering
       - HashIndex::get_path_contents_by_hash
       - HashIndex::list_by_hash
+  * requeue wal on restart
 
  */
 
@@ -1078,13 +1079,17 @@ int NewStore::_do_read(
   o->flush();
 
   r = 0;
-  for (p = o->onode.data_map.begin();   // fixme
-       length > 0 && p != o->onode.data_map.end();
-       ++p) {
-    dout(30) << __func__ << " x " << p->first << "~" << p->second.length << dendl;
-    if (p->first > offset && p != o->onode.data_map.begin()) {
-      --p;
-    }
+
+  p = o->onode.data_map.begin();   // fixme
+  if (p->first > offset && p != o->onode.data_map.begin()) {
+    --p;
+  }
+  for ( ; length > 0 && p != o->onode.data_map.end(); ++p) {
+    assert(p->first == 0);
+    assert(p->second.offset == 0);
+    assert(p->second.length == o->onode.size);
+    dout(30) << __func__ << " x " << p->first << "~" << p->second.length
+	     << " in " << p->second.fid << dendl;
     if (p->first + p->second.length <= offset) {
       dout(30) << __func__ << " skipping " << p->first << "~" << p->second.length
 	       << dendl;
@@ -1115,7 +1120,7 @@ int NewStore::_do_read(
     } else {
       x_off = 0;
     }
-    unsigned x_len = MIN(length, p->second.length);
+    unsigned x_len = MIN(length, p->second.length - x_off);
     dout(30) << __func__ << " data " << offset << "~" << x_len
 	     << " fid " << cur_fid << " offset " << x_off + p->second.offset
 	     << dendl;
@@ -1129,14 +1134,15 @@ int NewStore::_do_read(
     if (r < 0) {
       goto out;
     }
+    bl.claim_append(t);
     if ((unsigned)r < x_len) {
       derr << __func__ << "   short read " << r << " < " << x_len
 	   << " from " << cur_fid << " offset " << p->second.offset + x_off
 	   << dendl;
-      r = -EIO;
-      goto out;
+      bufferptr z(x_len - r);
+      z.zero();
+      bl.append(z);
     }
-    bl.claim_append(t);
     offset += x_len;
     length -= x_len;
   }
@@ -1816,7 +1822,13 @@ void NewStore::_txc_process_fsync(fsync_item *i)
 {
   dout(20) << __func__ << " txc " << i->txc << dendl;
   int r = ::fdatasync(i->fd);
-  assert(r == 0);
+  if (r < 0) {
+    r = -errno;
+    derr << __func__ << " error from fdatasync on " << i->fd
+	 << " txc " << i->txc
+	 << ": " << cpp_strerror(r) << dendl;
+    assert(0 == "error from fdatasync");
+  }
   if (i->txc->finish_fsync()) {
     _txc_finish_fsync(i->txc);
   }
@@ -2599,7 +2611,9 @@ int NewStore::_do_write(TransContext *txc,
       dout(20) << __func__ << " append " << f.fid << " writing "
 	       << (offset - f.offset) << "~" << length << dendl;
     }
-    o->onode.size = offset + length;
+    if (offset + length > o->onode.size) {
+      o->onode.size = offset + length;
+    }
     r = bl.write_fd(fd);
     if (r < 0)
       goto out;
@@ -2607,8 +2621,9 @@ int NewStore::_do_write(TransContext *txc,
   } else {
     // WAL
     assert(o->onode.data_map.size() == 1);
-    const fragment_t& f = o->onode.data_map.begin()->second;
+    fragment_t& f = o->onode.data_map.begin()->second;
     assert(f.offset == 0);
+    assert(f.length == o->onode.size);
     r = _clean_fid_tail(txc, f);
     if (r < 0)
       goto out;
@@ -2618,8 +2633,12 @@ int NewStore::_do_write(TransContext *txc,
     op->length = length;
     op->fid = f.fid;
     op->data = bl;
-    if (offset + length > o->onode.size)
+    if (offset + length > o->onode.size) {
       o->onode.size = offset + length;
+    }
+    if (offset + length - f.offset > f.length) {
+      f.length = offset + length - f.offset;
+    }
     dout(20) << __func__ << " wal " << f.fid << " write "
 	     << (offset - f.offset) << "~" << length << dendl;
   }
@@ -2655,7 +2674,7 @@ int NewStore::_clean_fid_tail(TransContext *txc, const fragment_t& f)
     txc->sync_fd(fd);
   } else {
     // all good!
-    VOID_TEMP_FAILURE_RETRY(::close(path_fd));
+    VOID_TEMP_FAILURE_RETRY(::close(fd));
   }
   return 0;
 }
@@ -2705,6 +2724,7 @@ int NewStore::_zero(TransContext *txc,
     assert(o->onode.data_map.size() == 1);
     fragment_t& f = o->onode.data_map.begin()->second;
     assert(f.offset == 0);
+    assert(f.length == o->onode.size);
 
     r = _clean_fid_tail(txc, f);
     if (r < 0)
@@ -2759,19 +2779,40 @@ int NewStore::_do_truncate(TransContext *txc, OnodeRef o, uint64_t offset)
   } else if (offset < o->onode.size) {
     assert(o->onode.data_map.size() == 1);
     fragment_t& f = o->onode.data_map.begin()->second;
+    assert(f.offset == 0);
+    assert(f.length == o->onode.size);
+    f.length = offset;
     wal_op_t *op = _get_wal_op(txc);
     op->op = wal_op_t::OP_TRUNCATE;
     op->offset = offset;
     op->fid = f.fid;
     assert(f.offset == 0);
-    f.length = offset;
   } else if (offset > o->onode.size) {
     // resize file up.  make sure we don't have trailing bytes
     assert(o->onode.data_map.size() == 1);
     fragment_t& f = o->onode.data_map.begin()->second;
+    assert(f.offset == 0);
+    assert(f.length == o->onode.size);
     int r = _clean_fid_tail(txc, f);
     if (r < 0)
       return r;
+    if (false) {  // hmm don't bother!!
+      // truncate up.  don't bother to fsync since it's all zeros.
+      int fd = _open_fid(f.fid);
+      if (fd < 0) {
+	return fd;
+      }
+      r = ::ftruncate(fd, offset);
+      if (r < 0) {
+	r = -errno;
+	derr << "error from ftruncate on " << f.fid << " to " << offset << ": "
+	     << cpp_strerror(r) << dendl;
+	VOID_TEMP_FAILURE_RETRY(::close(fd));
+	return r;
+      }
+      VOID_TEMP_FAILURE_RETRY(::close(fd));
+    }
+    f.length = offset;
   }
   o->onode.size = offset;
   txc->write_onode(o);

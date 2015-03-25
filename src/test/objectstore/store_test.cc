@@ -772,7 +772,7 @@ public:
     // hash
     //boost::binomial_distribution<uint32_t> bin(0xFFFFFF, 0.5);
     ++seq;
-    return ghobject_t(hobject_t(name, string(), rand() & 2 ? CEPH_NOSNAP : rand(), rand() & 0xFF, 0, ""));
+    return ghobject_t(hobject_t(name, string(), rand() & 2 ? CEPH_NOSNAP : rand(), rand() & 0xFF, 1, ""));
   }
 };
 
@@ -1148,9 +1148,17 @@ public:
       size_t max_len = contents[obj].data.length() - offset;
       if (len > max_len)
         len = max_len;
+      assert(len == result.length());
       ASSERT_EQ(len, result.length());
       contents[obj].data.copy(offset, len, bl);
       ASSERT_EQ(r, (int)len);
+      if (!result.contents_equal(bl)) {
+	cout << "result:\n";
+	result.hexdump(cout);
+	cout << "expected:\n";
+	bl.hexdump(cout);
+	assert(0);
+      }
       ASSERT_TRUE(result.contents_equal(bl));
     }
   }
@@ -1200,6 +1208,21 @@ public:
       if (next.is_max()) break;
       current = next;
     }
+    if (objects_set.size() != available_objects.size()) {
+      for (set<ghobject_t>::iterator p = objects_set.begin();
+	   p != objects_set.end();
+	   ++p)
+	if (available_objects.count(*p) == 0)
+	  cerr << "+ " << *p << std::endl;
+      for (set<ghobject_t>::iterator p = available_objects.begin();
+	   p != available_objects.end();
+	   ++p)
+	if (objects_set.count(*p) == 0)
+	  cerr << "- " << *p << std::endl;
+      //cerr << " objects_set: " << objects_set << std::endl;
+      //cerr << " available_set: " << available_objects << std::endl;
+      assert(0 == "badness");
+    }
     ASSERT_EQ(objects_set.size(), available_objects.size());
     for (set<ghobject_t>::iterator i = objects_set.begin();
 	 i != objects_set.end();
@@ -1232,6 +1255,7 @@ public:
     struct stat buf;
     int r = store->stat(cid, hoid, &buf);
     ASSERT_EQ(0, r);
+    assert(buf.st_size == contents[hoid].data.length());
     ASSERT_TRUE(buf.st_size == contents[hoid].data.length());
     {
       Mutex::Locker locker(lock);
@@ -1269,7 +1293,7 @@ TEST_P(StoreTest, Synthetic) {
   ObjectStore::Sequencer osr("test");
   MixedGenerator gen;
   gen_type rng(time(NULL));
-  coll_t cid(spg_t(pg_t(1,0), shard_id_t::NO_SHARD));
+  coll_t cid(spg_t(pg_t(0,1), shard_id_t::NO_SHARD));
 
   SyntheticWorkloadState test_obj(store.get(), &gen, &rng, &osr, cid);
   test_obj.init();
