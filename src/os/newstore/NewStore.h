@@ -380,6 +380,8 @@ private:
   Mutex fid_lock;
   fid_t fid_cur;
 
+  atomic64_t omap_id;
+
   Mutex wal_lock;
   atomic64_t wal_seq;
 
@@ -431,6 +433,9 @@ private:
   int _create_fid(fid_t *fid);
   int _open_fid(fid_t fid);
   int _remove_fid(fid_t fid);
+
+  int _recover_next_omap_id();
+  void _get_omap_id(TransContext *txc, OnodeRef o);
 
   int _clean_fid_tail(TransContext *txc, const fragment_t& f);
 
@@ -647,6 +652,25 @@ private:
   int _rmattrs(TransContext *txc,
 	       CollectionRef& c,
 	       const ghobject_t& oid);
+  int _omap_clear(TransContext *txc,
+		  CollectionRef& c,
+		  const ghobject_t& oid);
+  int _omap_setkeys(TransContext *txc,
+		    CollectionRef& c,
+		    const ghobject_t& oid,
+		    const map<string,bufferlist>& m);
+  int _omap_setheader(TransContext *txc,
+		      CollectionRef& c,
+		      const ghobject_t& oid,
+		      bufferlist& header);
+  int _omap_rmkeys(TransContext *txc,
+		   CollectionRef& c,
+		   const ghobject_t& oid,
+		   const set<string>& m);
+  int _omap_rmkey_range(TransContext *txc,
+			CollectionRef& c,
+			const ghobject_t& oid,
+			const string& first, const string& last);
   int _clone(TransContext *txc,
 	     CollectionRef& c,
 	     const ghobject_t& old_oid,

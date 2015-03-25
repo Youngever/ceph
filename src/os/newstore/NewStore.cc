@@ -56,6 +56,7 @@
 
 const string PREFIX_COLL = "C"; // collection name -> (nothing)
 const string PREFIX_OBJ = "O";  // object name -> onode
+const string PREFIX_OMAP = "M"; // u64 + keyname -> value
 const string PREFIX_WAL = "L";  // write ahead log
 
 
@@ -268,6 +269,35 @@ static int get_key_object(const string& key, ghobject_t *oid)
   return 0;
 }
 
+// '-' < '.' < '~'
+void get_omap_header(uint64_t id, string *out)
+{
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%016llx-", (unsigned long long)id);
+  *out = buf;
+}
+
+// hmm, I don't think there's any need to escape the user key since we
+// have a clean prefix.
+void get_omap_key(uint64_t id, const string& key, string *out)
+{
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%016llx.", (unsigned long long)id);
+  *out = buf;
+  out->append(key);
+}
+
+void decode_omap_key(const string& key, string *user_key)
+{
+  *user_key = key.substr(17);
+}
+
+void get_omap_tail(uint64_t id, string *out)
+{
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%016llx~", (unsigned long long)id);
+  *out = buf;
+}
 
 // Onode
 
@@ -398,7 +428,7 @@ NewStore::Collection::Collection(NewStore *ns, coll_t c)
     cid(c),
     lock("NewStore::Collection::lock"),
     onode_map() //store->cct, store->cct->_conf->newstore_onode_map_size)
-#warning fixme
+#warning fixme size the lru/cache
 {
 }
 
@@ -803,6 +833,10 @@ int NewStore::mount()
     goto out_frag;
 
   r = _recover_next_fid();
+  if (r < 0)
+    goto out_db;
+
+  r = _recover_next_omap_id();
   if (r < 0)
     goto out_db;
 
@@ -1340,7 +1374,45 @@ int NewStore::omap_get(
   map<string, bufferlist> *out /// < [out] Key to value map
   )
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid << " oid " << oid << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  RWLock::RLocker l(c->lock);
+  int r = 0;
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  if (!o->onode.omap_head)
+    goto out;
+  {
+    KeyValueDB::Iterator it = db->get_iterator(PREFIX_OMAP);
+    string head, tail;
+    get_omap_header(o->onode.omap_head, &head);
+    get_omap_tail(o->onode.omap_head, &tail);
+    it->lower_bound(head);
+    while (it->valid()) {
+      if (it->key() == head) {
+	dout(30) << __func__ << "  got header" << dendl;
+	*header = it->value();
+      } else if (it->key() == tail) {
+	dout(30) << __func__ << "  reached tail" << dendl;
+	break;
+      } else {
+	string user_key;
+	decode_omap_key(it->key(), &user_key);
+	dout(30) << __func__ << "  got " << it->key() << " -> " << user_key << dendl;
+	assert(it->key() < tail);
+	(*out)[user_key] = it->value();
+      }
+      it->next();
+    }
+  }
+ out:
+  dout(10) << __func__ << " " << cid << " oid " << oid << " = " << r << dendl;
+  return r;
 }
 
 int NewStore::omap_get_header(
@@ -1350,7 +1422,31 @@ int NewStore::omap_get_header(
   bool allow_eio ///< [in] don't assert on eio
   )
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid << " oid " << oid << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  RWLock::RLocker l(c->lock);
+  int r = 0;
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  if (!o->onode.omap_head)
+    goto out;
+  {
+    string head;
+    get_omap_header(o->onode.omap_head, &head);
+    if (db->get(PREFIX_OMAP, head, header) >= 0) {
+      dout(30) << __func__ << "  got header" << dendl;
+    } else {
+      dout(30) << __func__ << "  no header" << dendl;
+    }
+  }
+ out:
+  dout(10) << __func__ << " " << cid << " oid " << oid << " = " << r << dendl;
+  return r;
 }
 
 int NewStore::omap_get_keys(
@@ -1359,7 +1455,46 @@ int NewStore::omap_get_keys(
   set<string> *keys      ///< [out] Keys defined on oid
   )
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid << " oid " << oid << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  RWLock::RLocker l(c->lock);
+  int r = 0;
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  if (!o->onode.omap_head)
+    goto out;
+  {
+    KeyValueDB::Iterator it = db->get_iterator(PREFIX_OMAP);
+    string head, tail;
+    get_omap_header(o->onode.omap_head, &head);
+    get_omap_tail(o->onode.omap_head, &tail);
+    it->lower_bound(head);
+    while (it->valid()) {
+      if (it->key() == head) {
+	dout(30) << __func__ << "  skipping head" << dendl;
+	it->next();
+	continue;
+      }
+      if (it->key() == tail) {
+	dout(30) << __func__ << "  reached tail" << dendl;
+	break;
+      }
+      string user_key;
+      decode_omap_key(it->key(), &user_key);
+      dout(30) << __func__ << "  got " << it->key() << " -> " << user_key << dendl;
+      assert(it->key() < tail);
+      keys->insert(user_key);
+      it->next();
+    }
+  }
+ out:
+  dout(10) << __func__ << " " << cid << " oid " << oid << " = " << r << dendl;
+  return r;
 }
 
 int NewStore::omap_get_values(
@@ -1369,7 +1504,31 @@ int NewStore::omap_get_values(
   map<string, bufferlist> *out ///< [out] Returned keys and values
   )
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid << " oid " << oid << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  RWLock::RLocker l(c->lock);
+  int r = 0;
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  if (!o->onode.omap_head)
+    goto out;
+  for (set<string>::const_iterator p = keys.begin(); p != keys.end(); ++p) {
+    string key;
+    get_omap_key(o->onode.omap_head, *p, &key);
+    bufferlist val;
+    if (db->get(PREFIX_OMAP, key, &val) >= 0) {
+      dout(30) << __func__ << "  got " << key << " -> " << *p << dendl;
+      out->insert(make_pair(*p, val));
+    }
+  }
+ out:
+  dout(10) << __func__ << " " << cid << " oid " << oid << " = " << r << dendl;
+  return r;
 }
 
 int NewStore::omap_check_keys(
@@ -1379,7 +1538,33 @@ int NewStore::omap_check_keys(
   set<string> *out         ///< [out] Subset of keys defined on oid
   )
 {
-  assert(0);
+  dout(15) << __func__ << " " << cid << " oid " << oid << dendl;
+  CollectionRef c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  RWLock::RLocker l(c->lock);
+  int r = 0;
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  if (!o->onode.omap_head)
+    goto out;
+  for (set<string>::const_iterator p = keys.begin(); p != keys.end(); ++p) {
+    string key;
+    get_omap_key(o->onode.omap_head, *p, &key);
+    bufferlist val;
+    if (db->get(PREFIX_OMAP, key, &val) >= 0) {
+      dout(30) << __func__ << "  have " << key << " -> " << *p << dendl;
+      out->insert(*p);
+    } else {
+      dout(30) << __func__ << "  miss " << key << " -> " << *p << dendl;
+    }
+  }
+ out:
+  dout(10) << __func__ << " " << cid << " oid " << oid << " = " << r << dendl;
+  return r;
 }
 
 ObjectMap::ObjectMapIterator NewStore::get_omap_iterator(
@@ -1393,6 +1578,40 @@ ObjectMap::ObjectMapIterator NewStore::get_omap_iterator(
 
 // -----------------
 // write helpers
+
+int NewStore::_recover_next_omap_id()
+{
+  KeyValueDB::Iterator it = db->get_iterator(PREFIX_OMAP);
+  it->lower_bound("GGGGGGGG");
+  if (!it->valid()) {
+    omap_id.set(1);
+    dout(10) << __func__ << " no omap keys, starting at 1" << dendl;
+    return 0;
+  }
+  dout(20) << __func__ << " last key is " << it->key() << dendl;
+  uint64_t id;
+  int r = sscanf(it->key().c_str(), "%llx", (unsigned long long*)&id);
+  if (r < 0) {
+    derr << "unable to parse " << it->key() << dendl;
+    return -EIO;
+  }
+  omap_id.set(id);
+  return 0;
+}
+
+void NewStore::_get_omap_id(TransContext *txc, OnodeRef o)
+{
+  if (o->onode.omap_head)
+    return;
+
+  o->onode.omap_head = omap_id.inc();
+  dout(10) << __func__ << " assigned " << o->oid
+	   << " id " << o->onode.omap_head << dendl;
+  string tail;
+  get_omap_tail(o->onode.omap_head, &tail);
+  bufferlist empty;
+  txc->t->set(PREFIX_OMAP, tail, empty);
+}
 
 int NewStore::_recover_next_fid()
 {
@@ -2101,51 +2320,41 @@ int NewStore::_do_transaction(Transaction *t,
 
     case Transaction::OP_OMAP_CLEAR:
       {
-        coll_t cid = i.get_cid(op->cid);
         ghobject_t oid = i.get_oid(op->oid);
-	//r = _omap_clear(cid, oid);
-	assert(0 == "write me");
+	r = _omap_clear(txc, c, oid);
       }
       break;
     case Transaction::OP_OMAP_SETKEYS:
       {
-        coll_t cid = i.get_cid(op->cid);
         ghobject_t oid = i.get_oid(op->oid);
         map<string, bufferlist> aset;
         i.decode_attrset(aset);
-	//r = _omap_setkeys(cid, oid, aset);
-	assert(0 == "write me");
+	r = _omap_setkeys(txc, c, oid, aset);
       }
       break;
     case Transaction::OP_OMAP_RMKEYS:
       {
-        coll_t cid = i.get_cid(op->cid);
         ghobject_t oid = i.get_oid(op->oid);
         set<string> keys;
         i.decode_keyset(keys);
-	//r = _omap_rmkeys(cid, oid, keys);
-	assert(0 == "write me");
+	r = _omap_rmkeys(txc, c, oid, keys);
       }
       break;
     case Transaction::OP_OMAP_RMKEYRANGE:
       {
-        coll_t cid = i.get_cid(op->cid);
         ghobject_t oid = i.get_oid(op->oid);
         string first, last;
         first = i.decode_string();
         last = i.decode_string();
-	//r = _omap_rmkeyrange(cid, oid, first, last);
-	assert(0 == "write me");
+	r = _omap_rmkey_range(txc, c, oid, first, last);
       }
       break;
     case Transaction::OP_OMAP_SETHEADER:
       {
-        coll_t cid = i.get_cid(op->cid);
         ghobject_t oid = i.get_oid(op->oid);
         bufferlist bl;
         i.decode_bl(bl);
-	//r = _omap_setheader(cid, oid, bl);
-	assert(0 == "write me");
+	r = _omap_setheader(txc, c, oid, bl);
       }
       break;
     case Transaction::OP_SPLIT_COLLECTION:
@@ -2580,6 +2789,167 @@ int NewStore::_rmattrs(TransContext *txc,
   }
   o->onode.attrs.clear();
   txc->write_onode(o);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_omap_clear(TransContext *txc,
+			  CollectionRef& c,
+			  const ghobject_t& oid)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  if (o->onode.omap_head != 0) {
+    KeyValueDB::Iterator it = db->get_iterator(PREFIX_OMAP);
+    string prefix, tail;
+    get_omap_header(o->onode.omap_head, &prefix);
+    get_omap_tail(o->onode.omap_head, &tail);
+    it->lower_bound(prefix);
+    while (it->valid()) {
+      if (it->key() == tail) {
+	dout(30) << __func__ << "  stop at " << tail << dendl;
+	break;
+      }
+      txc->t->rmkey(PREFIX_OMAP, it->key());
+      dout(30) << __func__ << "  rm " << it->key() << dendl;
+      it->next();
+    }
+  }
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_omap_setkeys(TransContext *txc,
+			    CollectionRef& c,
+			    const ghobject_t& oid,
+			    const map<string,bufferlist>& m)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  _get_omap_id(txc, o);
+  for (map<string,bufferlist>::const_iterator p = m.begin(); p != m.end(); ++p) {
+    string key;
+    get_omap_key(o->onode.omap_head, p->first, &key);
+    dout(30) << __func__ << "  " << key << " <- " << p->first << dendl;
+    txc->t->set(PREFIX_OMAP, key, p->second);
+  }
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_omap_setheader(TransContext *txc,
+			      CollectionRef& c,
+			      const ghobject_t& oid,
+			      bufferlist& bl)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  string key;
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  _get_omap_id(txc, o);
+  get_omap_header(o->onode.omap_head, &key);
+  txc->t->set(PREFIX_OMAP, key, bl);
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_omap_rmkeys(TransContext *txc,
+			   CollectionRef& c,
+			   const ghobject_t& oid,
+			   const set<string>& m)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  if (!o->onode.omap_head) {
+    r = 0;
+    goto out;
+  }
+  _get_omap_id(txc, o);
+  for (set<string>::const_iterator p = m.begin(); p != m.end(); ++p) {
+    string key;
+    get_omap_key(o->onode.omap_head, *p, &key);
+    dout(30) << __func__ << "  rm " << key << " <- " << *p << dendl;
+    txc->t->rmkey(PREFIX_OMAP, key);
+  }
+  r = 0;
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_omap_rmkey_range(TransContext *txc,
+				CollectionRef& c,
+				const ghobject_t& oid,
+				const string& first, const string& last)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid << dendl;
+  int r = 0;
+  KeyValueDB::Iterator it;
+  string key_first, key_last;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  if (!o->onode.omap_head) {
+    r = 0;
+    goto out;
+  }
+  it = db->get_iterator(PREFIX_OMAP);
+  get_omap_key(o->onode.omap_head, first, &key_first);
+  get_omap_key(o->onode.omap_head, last, &key_last);
+  it->lower_bound(key_first);
+  while (it->valid()) {
+    if (it->key() > key_last) {
+      dout(30) << __func__ << "  stop at " << key_last << dendl;
+      break;
+    }
+    txc->t->rmkey(PREFIX_OMAP, it->key());
+    dout(30) << __func__ << "  rm " << it->key() << dendl;
+    it->next();
+  }
   r = 0;
 
  out:
