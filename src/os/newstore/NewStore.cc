@@ -3239,7 +3239,7 @@ int NewStore::_rename(TransContext *txc,
       return r;
   }
 
-  get_object_key(old_oid, NULL);
+  get_object_key(old_oid, &old_key);
   get_object_key(new_oid, &new_key);
 
   c->onode_map.rename(old_oid, new_oid);
