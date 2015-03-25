@@ -120,43 +120,17 @@ public:
   class OmapIteratorImpl : public ObjectMap::ObjectMapIteratorImpl {
     CollectionRef c;
     OnodeRef o;
-    //map<string,bufferlist>::iterator it;
+    KeyValueDB::Iterator it;
+    string head, tail;
   public:
-    OmapIteratorImpl(CollectionRef c, OnodeRef o)
-      : c(c), o(o) /*, it(o->omap.begin())*/ {}
-
-    int seek_to_first() {
-      RWLock::RLocker l(c->lock);
-      //it = o->omap.begin();
-      return 0;
-    }
-    int upper_bound(const string &after) {
-      RWLock::RLocker l(c->lock);
-      //it = o->omap.upper_bound(after);
-      return 0;
-    }
-    int lower_bound(const string &to) {
-      RWLock::RLocker l(c->lock);
-      //it = o->omap.lower_bound(to);
-      return 0;
-    }
-    bool valid() {
-      RWLock::RLocker l(c->lock);
-      return false; //return it != o->omap.end();
-    }
-    int next() {
-      RWLock::RLocker l(c->lock);
-      //++it;
-      return 0;
-    }
-    string key() {
-      RWLock::RLocker l(c->lock);
-      return string(); //return it->first;
-    }
-    bufferlist value() {
-      RWLock::RLocker l(c->lock);
-      return bufferlist(); //return it->second;
-    }
+    OmapIteratorImpl(CollectionRef c, OnodeRef o);
+    int seek_to_first();
+    int upper_bound(const string &after);
+    int lower_bound(const string &to);
+    bool valid();
+    int next();
+    string key();
+    bufferlist value();
     int status() {
       return 0;
     }
@@ -627,6 +601,9 @@ private:
 	    CollectionRef& c,
 	    const ghobject_t& oid,
 	    uint64_t offset, size_t len);
+  int _do_truncate(TransContext *txc,
+		   OnodeRef o,
+		   uint64_t offset);
   int _truncate(TransContext *txc,
 		CollectionRef& c,
 		const ghobject_t& oid,

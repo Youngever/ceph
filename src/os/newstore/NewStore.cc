@@ -1367,6 +1367,86 @@ int NewStore::collection_list_range(
   return r;
 }
 
+// omap reads
+
+NewStore::OmapIteratorImpl::OmapIteratorImpl(CollectionRef c, OnodeRef o)
+  : c(c), o(o)
+{
+  RWLock::RLocker l(c->lock);
+  if (o->onode.omap_head) {
+    get_omap_header(o->onode.omap_head, &head);
+    get_omap_tail(o->onode.omap_head, &tail);
+    it->upper_bound(head);
+  }
+}
+
+int NewStore::OmapIteratorImpl::seek_to_first()
+{
+  RWLock::RLocker l(c->lock);
+  if (o->onode.omap_head) {
+    it->upper_bound(head);
+  } else {
+    it = KeyValueDB::Iterator();
+  }
+  return 0;
+}
+
+int NewStore::OmapIteratorImpl::upper_bound(const string& after)
+{
+  RWLock::RLocker l(c->lock);
+  if (o->onode.omap_head) {
+    string key;
+    get_omap_key(o->onode.omap_head, after, &key);
+    it->upper_bound(head);
+  } else {
+    it = KeyValueDB::Iterator();
+  }
+  return 0;
+}
+
+int NewStore::OmapIteratorImpl::lower_bound(const string& to)
+{
+  RWLock::RLocker l(c->lock);
+  if (o->onode.omap_head) {
+    string key;
+    get_omap_key(o->onode.omap_head, to, &key);
+    it->lower_bound(head);
+  } else {
+    it = KeyValueDB::Iterator();
+  }
+  return 0;
+}
+
+bool NewStore::OmapIteratorImpl::valid()
+{
+  RWLock::RLocker l(c->lock);
+  return it->valid();
+}
+
+int NewStore::OmapIteratorImpl::next()
+{
+  RWLock::RLocker l(c->lock);
+  it->next();
+  if (!it->valid() || it->key() == tail) {
+    it = KeyValueDB::Iterator();
+  }
+  return 0;
+}
+
+string NewStore::OmapIteratorImpl::key()
+{
+  RWLock::RLocker l(c->lock);
+  assert(it->valid());
+  return it->key();
+}
+
+bufferlist NewStore::OmapIteratorImpl::value()
+{
+  RWLock::RLocker l(c->lock);
+  assert(it->valid());
+  return it->value();
+}
+
 int NewStore::omap_get(
   coll_t cid,                ///< [in] Collection containing oid
   const ghobject_t &oid,   ///< [in] Object containing omap
@@ -1995,6 +2075,29 @@ int NewStore::_apply_wal_transaction(TransContext *txc)
 	sync_fds.push_back(fd);
       }
       break;
+    case wal_op_t::OP_ZERO:
+      {
+	dout(20) << __func__ << " zero " << p->fid << " "
+		 << p->offset << "~" << p->length << dendl;
+	int fd = _open_fid(p->fid);
+	if (fd < 0)
+	  return fd;
+	int r = ::lseek64(fd, p->offset, SEEK_SET);
+	if (r < 0) {
+	  r = -errno;
+	  derr << __func__ << " lseek64 on " << fd << " got: "
+	       << cpp_strerror(r) << dendl;
+	  return r;
+	}
+#warning use hole punch ioctl to zero when available
+	bufferlist bl;
+	bufferptr bp(p->length);
+	bp.zero();
+	bl.append(bp);
+	bl.write_fd(fd);
+	sync_fds.push_back(fd);
+      }
+      break;
     case wal_op_t::OP_TRUNCATE:
       {
 	dout(20) << __func__ << " truncate " << p->fid << " "
@@ -2589,30 +2692,61 @@ int NewStore::_zero(TransContext *txc,
 	   << dendl;
   int r = 0;
 
-  assert(0 == "write me");
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, true);
 
+  if (o->onode.data_map.empty()) {
+    // we're already a big hole
+    if (offset + length > o->onode.size) {
+      o->onode.size = offset + length;
+      txc->write_onode(o);
+    }
+  } else {
+    assert(o->onode.data_map.size() == 1);
+    fragment_t& f = o->onode.data_map.begin()->second;
+    assert(f.offset == 0);
+
+    r = _clean_fid_tail(txc, f);
+    if (r < 0)
+      goto out;
+
+    if (offset >= o->onode.size) {
+      // after tail
+      int fd = _open_fid(f.fid);
+      if (fd < 0) {
+	r = fd;
+	goto out;
+      }
+      f.length = (offset + length) - f.offset;
+      ::ftruncate(fd, f.length);
+      dout(20) << __func__ << " tail " << f.fid << " truncating up to "
+	       << f.length << dendl;
+      o->onode.size = offset + length;
+      txc->write_onode(o);
+    } else {
+      // WAL
+      wal_op_t *op = _get_wal_op(txc);
+      op->op = wal_op_t::OP_ZERO;
+      op->offset = offset - f.offset;
+      op->length = length;
+      op->fid = f.fid;
+      if (offset + length > o->onode.size) {
+	f.length = offset + length - f.offset;
+	o->onode.size = offset + length;
+	txc->write_onode(o);
+      }
+    }
+  }
+
+ out:
   dout(10) << __func__ << " " << c->cid << " " << oid
 	   << " " << offset << "~" << length
 	   << " = " << r << dendl;
   return r;
 }
 
-int NewStore::_truncate(TransContext *txc,
-			CollectionRef& c,
-			const ghobject_t& oid,
-			uint64_t offset)
+int NewStore::_do_truncate(TransContext *txc, OnodeRef o, uint64_t offset)
 {
-  dout(15) << __func__ << " " << c->cid << " " << oid
-	   << " " << offset
-	   << dendl;
-  int r = 0;
-
-  RWLock::WLocker l(c->lock);
-  OnodeRef o = c->get_onode(oid, true);
-  if (!o->exists) {
-    r = -ENOENT;
-    goto out;
-  }
   if (o->onode.data_map.empty()) {
     o->onode.size = offset;
   } else if (offset == 0) {
@@ -2635,12 +2769,32 @@ int NewStore::_truncate(TransContext *txc,
     // resize file up.  make sure we don't have trailing bytes
     assert(o->onode.data_map.size() == 1);
     fragment_t& f = o->onode.data_map.begin()->second;
-    r = _clean_fid_tail(txc, f);
+    int r = _clean_fid_tail(txc, f);
     if (r < 0)
-      goto out;
+      return r;
   }
   o->onode.size = offset;
   txc->write_onode(o);
+  return 0;
+}
+
+int NewStore::_truncate(TransContext *txc,
+			CollectionRef& c,
+			const ghobject_t& oid,
+			uint64_t offset)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " " << offset
+	   << dendl;
+  int r = 0;
+
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, true);
+  if (!o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+  r = _do_truncate(txc, o, offset);
 
  out:
   dout(10) << __func__ << " " << c->cid << " " << oid
