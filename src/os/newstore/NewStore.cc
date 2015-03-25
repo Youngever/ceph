@@ -2666,6 +2666,9 @@ int NewStore::_do_remove(TransContext *txc,
   }
   o->onode.data_map.clear();
   o->onode.size = 0;
+  if (o->onode.omap_head) {
+    _do_omap_clear(txc, o->onode.omap_head, true);
+  }
 
   get_object_key(o->oid, &key);
   txc->t->rmkey(PREFIX_OBJ, key);
@@ -2796,6 +2799,28 @@ int NewStore::_rmattrs(TransContext *txc,
   return r;
 }
 
+void NewStore::_do_omap_clear(TransContext *txc, uint64_t id,
+			      bool remove_tail)
+{
+  KeyValueDB::Iterator it = db->get_iterator(PREFIX_OMAP);
+  string prefix, tail;
+  get_omap_header(id, &prefix);
+  get_omap_tail(id, &tail);
+  it->lower_bound(prefix);
+  while (it->valid()) {
+    if (it->key() == tail) {
+      if (remove_tail) {
+	txc->t->rmkey(PREFIX_OMAP, it->key());
+      }
+      dout(30) << __func__ << "  stop at " << tail << dendl;
+      break;
+    }
+    txc->t->rmkey(PREFIX_OMAP, it->key());
+    dout(30) << __func__ << "  rm " << it->key() << dendl;
+    it->next();
+  }
+}
+
 int NewStore::_omap_clear(TransContext *txc,
 			  CollectionRef& c,
 			  const ghobject_t& oid)
@@ -2810,20 +2835,7 @@ int NewStore::_omap_clear(TransContext *txc,
     goto out;
   }
   if (o->onode.omap_head != 0) {
-    KeyValueDB::Iterator it = db->get_iterator(PREFIX_OMAP);
-    string prefix, tail;
-    get_omap_header(o->onode.omap_head, &prefix);
-    get_omap_tail(o->onode.omap_head, &tail);
-    it->lower_bound(prefix);
-    while (it->valid()) {
-      if (it->key() == tail) {
-	dout(30) << __func__ << "  stop at " << tail << dendl;
-	break;
-      }
-      txc->t->rmkey(PREFIX_OMAP, it->key());
-      dout(30) << __func__ << "  rm " << it->key() << dendl;
-      it->next();
-    }
+    _do_omap_clear(txc, o->onode.omap_head, false);
   }
   r = 0;
 
@@ -2942,7 +2954,7 @@ int NewStore::_omap_rmkey_range(TransContext *txc,
   get_omap_key(o->onode.omap_head, last, &key_last);
   it->lower_bound(key_first);
   while (it->valid()) {
-    if (it->key() > key_last) {
+    if (it->key() >= key_last) {
       dout(30) << __func__ << "  stop at " << key_last << dendl;
       break;
     }

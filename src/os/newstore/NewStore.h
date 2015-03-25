@@ -652,6 +652,7 @@ private:
   int _rmattrs(TransContext *txc,
 	       CollectionRef& c,
 	       const ghobject_t& oid);
+  void _do_omap_clear(TransContext *txc, uint64_t id, bool remove_tail);
   int _omap_clear(TransContext *txc,
 		  CollectionRef& c,
 		  const ghobject_t& oid);

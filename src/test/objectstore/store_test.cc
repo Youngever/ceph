@@ -1629,6 +1629,54 @@ TEST_P(StoreTest, OMapTest) {
     ASSERT_TRUE(bl3.contents_equal(bl1));
   }
 
+  // test omap_clear, omap_rmkey_range
+  {
+    {
+      map<string,bufferlist> to_set;
+      for (int n=0; n<10; ++n) {
+	to_set[stringify(n)].append("foo");
+      }
+      bufferlist h;
+      h.append("header");
+      ObjectStore::Transaction t;
+      t.remove(cid, hoid);
+      t.touch(cid, hoid);
+      t.omap_setheader(cid, hoid, h);
+      t.omap_setkeys(cid, hoid, to_set);
+      store->apply_transaction(t);
+    }
+    {
+      ObjectStore::Transaction t;
+      t.omap_rmkeyrange(cid, hoid, "3", "7");
+      store->apply_transaction(t);
+    }
+    {
+      bufferlist hdr;
+      map<string,bufferlist> m;
+      store->omap_get(cid, hoid, &hdr, &m);
+      ASSERT_EQ(6, hdr.length());
+      ASSERT_TRUE(m.count("2"));
+      ASSERT_TRUE(!m.count("3"));
+      ASSERT_TRUE(!m.count("6"));
+      ASSERT_TRUE(m.count("7"));
+      ASSERT_TRUE(m.count("8"));
+      //cout << m << std::endl;
+      ASSERT_EQ(6, m.size());
+    }
+    {
+      ObjectStore::Transaction t;
+      t.omap_clear(cid, hoid);
+      store->apply_transaction(t);
+    }
+    {
+      bufferlist hdr;
+      map<string,bufferlist> m;
+      store->omap_get(cid, hoid, &hdr, &m);
+      ASSERT_EQ(0, hdr.length());
+      ASSERT_EQ(0, m.size());
+    }
+  }
+
   ObjectStore::Transaction t;
   t.remove(cid, hoid);
   t.remove_collection(cid);
@@ -2040,6 +2088,7 @@ INSTANTIATE_TEST_CASE_P(
   StoreTest,
   //::testing::Values("memstore", "filestore", "keyvaluestore"));
   ::testing::Values("newstore"));
+//::testing::Values("filestore"));
 
 #else
 
