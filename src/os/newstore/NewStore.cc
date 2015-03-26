@@ -1943,6 +1943,14 @@ void NewStore::_txc_finish_kv(TransContext *txc)
   // loop in case we race with OpSequencer::flush_commit()
   do {
     txc->osr->qlock.Unlock();
+    if (txc->onreadable_sync) {
+      txc->onreadable_sync->complete(0);
+      txc->onreadable_sync = NULL;
+    }
+    if (txc->onreadable) {
+      finisher.queue(txc->onreadable);
+      txc->onreadable = NULL;
+    }
     if (txc->oncommit) {
       txc->oncommit->complete(0);
       txc->oncommit = NULL;
@@ -2196,11 +2204,8 @@ int NewStore::queue_transactions(
     _do_transaction(*p, txc, handle);
   }
 
-  if (onreadable_sync)
-    onreadable_sync->complete(0);
-  if (onreadable)
-    finisher.queue(onreadable);
-
+  txc->onreadable = onreadable;
+  txc->onreadable_sync = onreadable_sync;
   txc->oncommit = ondisk;
 
   r = _txc_finalize(osr, txc);

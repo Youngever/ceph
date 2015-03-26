@@ -181,6 +181,8 @@ public:
     set<OnodeRef> onodes;     ///< these onodes need to be updated/written
     KeyValueDB::Transaction t; ///< then we will commit this
     Context *oncommit;         ///< signal on commit
+    Context *onreadable;         ///< signal on readable
+    Context *onreadable_sync;         ///< signal on readable
     list<Context*> oncommits;  ///< more commit completions
     list<CollectionRef> removed_collections; ///< colls we removed
 
@@ -193,6 +195,9 @@ public:
     TransContext(OpSequencer *o)
       : state(STATE_PREPARE),
 	osr(o),
+	oncommit(NULL),
+	onreadable(NULL),
+	onreadable_sync(NULL),
 	wal_txn(NULL),
 	num_fsyncs_completed(0),
 	lock("NewStore::TransContext::lock") {
