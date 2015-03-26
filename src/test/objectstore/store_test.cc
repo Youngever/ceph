@@ -458,7 +458,8 @@ TEST_P(StoreTest, Sort) {
 
 TEST_P(StoreTest, MultipoolListTest) {
   int r;
-  coll_t cid = coll_t(spg_t(pg_t(0, 1), shard_id_t::NO_SHARD));
+  int poolid = 4373;
+  coll_t cid = coll_t(spg_t(pg_t(0, poolid), shard_id_t::NO_SHARD));
   {
     ObjectStore::Transaction t;
     t.create_collection(cid, 0);
@@ -474,9 +475,9 @@ TEST_P(StoreTest, MultipoolListTest) {
       name += stringify(i);
       ghobject_t hoid(hobject_t(sobject_t(name, CEPH_NOSNAP)));
       if (rand() & 1)
-	hoid.hobj.pool = -3;
+	hoid.hobj.pool = -1 - poolid;
       else
-	hoid.hobj.pool = 1;
+	hoid.hobj.pool = poolid;
       all.insert(hoid);
       t.touch(cid, hoid);
       cerr << "Creating object " << hoid << std::endl;
