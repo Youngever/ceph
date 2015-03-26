@@ -32,6 +32,7 @@
   TODO:
 
   * omap
+  * collection_list_range
   * lru trimming
   * lru get_next more efficient (intrusive_ptr?)
   * sequencer flush machinery
@@ -52,6 +53,9 @@
       - HashIndex::get_path_contents_by_hash
       - HashIndex::list_by_hash
   * requeue wal on restart
+  * open-by-handle
+  * avoid mtime updates when doing open-by-handle
+  * abstract out fs specifics
 
  */
 
@@ -1313,7 +1317,12 @@ int NewStore::collection_list_partial(
   if (start == ghobject_t::get_max())
     goto out;
   get_coll_key_range(cid, c->cnode.bits, &start_range_key, &end_key);
-  get_object_key(start, &start_key);
+  if (start == ghobject_t()) {
+    start_key = start_range_key;
+  } else {
+    get_object_key(start, &start_key);
+    assert(start_key >= start_range_key);
+  }
   dout(20) << __func__ << " range " << start_range_key << " to " << end_key
 	   << " start " << start << dendl;
   it = db->get_iterator(PREFIX_OBJ);
@@ -1360,6 +1369,7 @@ int NewStore::collection_list_range(
   int r = 0;
   pair<ghobject_t,OnodeRef> next;
   next.first = start;
+  assert(0 == "write me");
   while (true) {
     if (!c->onode_map.get_next(next.first, &next)) {
       break;

@@ -1214,8 +1214,10 @@ public:
       for (set<ghobject_t>::iterator p = objects_set.begin();
 	   p != objects_set.end();
 	   ++p)
-	if (available_objects.count(*p) == 0)
+	if (available_objects.count(*p) == 0) {
 	  cerr << "+ " << *p << std::endl;
+	  assert(0);
+	}
       for (set<ghobject_t>::iterator p = available_objects.begin();
 	   p != available_objects.end();
 	   ++p)
@@ -1297,9 +1299,9 @@ public:
 
 TEST_P(StoreTest, Synthetic) {
   ObjectStore::Sequencer osr("test");
-  MixedGenerator gen(1);
+  MixedGenerator gen(555);
   gen_type rng(time(NULL));
-  coll_t cid(spg_t(pg_t(0,1), shard_id_t::NO_SHARD));
+  coll_t cid(spg_t(pg_t(0,555), shard_id_t::NO_SHARD));
 
   SyntheticWorkloadState test_obj(store.get(), &gen, &rng, &osr, cid);
   test_obj.init();
@@ -1335,9 +1337,9 @@ TEST_P(StoreTest, Synthetic) {
 
 TEST_P(StoreTest, AttrSynthetic) {
   ObjectStore::Sequencer osr("test");
-  MixedGenerator gen(4);
+  MixedGenerator gen(447);
   gen_type rng(time(NULL));
-  coll_t cid(spg_t(pg_t(0,4),shard_id_t::NO_SHARD));
+  coll_t cid(spg_t(pg_t(0,447),shard_id_t::NO_SHARD));
 
   SyntheticWorkloadState test_obj(store.get(), &gen, &rng, &osr, cid);
   test_obj.init();
