@@ -1136,9 +1136,9 @@ int NewStore::_do_read(
     }
     bl.claim_append(t);
     if ((unsigned)r < x_len) {
-      derr << __func__ << "   short read " << r << " < " << x_len
-	   << " from " << cur_fid << " offset " << p->second.offset + x_off
-	   << dendl;
+      dout(10) << __func__ << "   short read " << r << " < " << x_len
+	       << " from " << cur_fid << " offset " << p->second.offset + x_off
+	       << dendl;
       bufferptr z(x_len - r);
       z.zero();
       bl.append(z);
@@ -1154,6 +1154,9 @@ int NewStore::_do_read(
   }
   r = bl.length();
  out:
+  if (fd >= 0) {
+    VOID_TEMP_FAILURE_RETRY(::close(fd));
+  }
   return r;
 }
 
@@ -1829,6 +1832,7 @@ void NewStore::_txc_process_fsync(fsync_item *i)
 	 << ": " << cpp_strerror(r) << dendl;
     assert(0 == "error from fdatasync");
   }
+  VOID_TEMP_FAILURE_RETRY(::close(i->fd));
   if (i->txc->finish_fsync()) {
     _txc_finish_fsync(i->txc);
   }
