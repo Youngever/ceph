@@ -755,7 +755,8 @@ public:
 class MixedGenerator : public ObjectGenerator {
 public:
   unsigned seq;
-  MixedGenerator() : seq(0) {}
+  int64_t poolid;
+  MixedGenerator(int64_t p) : seq(0), poolid(p) {}
   ghobject_t create_object(gen_type *gen) {
     char buf[100];
     snprintf(buf, sizeof(buf), "%u", seq);
@@ -772,7 +773,7 @@ public:
     // hash
     //boost::binomial_distribution<uint32_t> bin(0xFFFFFF, 0.5);
     ++seq;
-    return ghobject_t(hobject_t(name, string(), rand() & 2 ? CEPH_NOSNAP : rand(), rand() & 0xFF, 1, ""));
+    return ghobject_t(hobject_t(name, string(), rand() & 2 ? CEPH_NOSNAP : rand(), rand() & 0xFF, poolid, ""));
   }
 };
 
@@ -1296,7 +1297,7 @@ public:
 
 TEST_P(StoreTest, Synthetic) {
   ObjectStore::Sequencer osr("test");
-  MixedGenerator gen;
+  MixedGenerator gen(1);
   gen_type rng(time(NULL));
   coll_t cid(spg_t(pg_t(0,1), shard_id_t::NO_SHARD));
 
@@ -1334,9 +1335,9 @@ TEST_P(StoreTest, Synthetic) {
 
 TEST_P(StoreTest, AttrSynthetic) {
   ObjectStore::Sequencer osr("test");
-  MixedGenerator gen;
+  MixedGenerator gen(4);
   gen_type rng(time(NULL));
-  coll_t cid(spg_t(pg_t(4,0),shard_id_t::NO_SHARD));
+  coll_t cid(spg_t(pg_t(0,4),shard_id_t::NO_SHARD));
 
   SyntheticWorkloadState test_obj(store.get(), &gen, &rng, &osr, cid);
   test_obj.init();
