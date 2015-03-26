@@ -2504,9 +2504,12 @@ int NewStore::_do_transaction(Transaction *t,
 
     case Transaction::OP_SETALLOCHINT:
       {
-        coll_t cid = i.get_cid(op->cid);
         ghobject_t oid = i.get_oid(op->oid);
-	assert(0 == "write me");
+        uint64_t expected_object_size = op->expected_object_size;
+        uint64_t expected_write_size = op->expected_write_size;
+	r = _setallochint(txc, c, oid,
+			  expected_object_size,
+			  expected_write_size);
       }
       break;
 
@@ -3180,6 +3183,36 @@ int NewStore::_omap_rmkey_range(TransContext *txc,
 
  out:
   dout(10) << __func__ << " " << c->cid << " " << oid << " = " << r << dendl;
+  return r;
+}
+
+int NewStore::_setallochint(TransContext *txc,
+			    CollectionRef& c,
+			    const ghobject_t& oid,
+			    uint64_t expected_object_size,
+			    uint64_t expected_write_size)
+{
+  dout(15) << __func__ << " " << c->cid << " " << oid
+	   << " object_size " << expected_object_size
+	   << " write_size " << expected_write_size
+	   << dendl;
+  int r = 0;
+  RWLock::WLocker l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    r = -ENOENT;
+    goto out;
+  }
+
+  o->onode.expected_object_size = expected_object_size;
+  o->onode.expected_write_size = expected_write_size;
+  txc->write_onode(o);
+
+ out:
+  dout(10) << __func__ << " " << c->cid << " " << oid
+	   << " object_size " << expected_object_size
+	   << " write_size " << expected_write_size
+	   << " = " << r << dendl;
   return r;
 }
 

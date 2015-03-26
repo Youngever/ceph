@@ -654,6 +654,11 @@ private:
 			CollectionRef& c,
 			const ghobject_t& oid,
 			const string& first, const string& last);
+  int _setallochint(TransContext *txc,
+		    CollectionRef& c,
+		    const ghobject_t& oid,
+		    uint64_t expected_object_size,
+		    uint64_t expected_write_size);
   int _clone(TransContext *txc,
 	     CollectionRef& c,
 	     const ghobject_t& old_oid,

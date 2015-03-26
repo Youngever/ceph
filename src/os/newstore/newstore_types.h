@@ -95,7 +95,13 @@ struct onode_t {
   map<uint64_t, fragment_t> data_map;  ///< data (offset to fragment mapping)
   uint64_t omap_head;                  ///< id for omap root node
 
-  onode_t() : size(0), omap_head(0) {}
+  uint32_t expected_object_size;
+  uint32_t expected_write_size;
+
+  onode_t()
+    : size(0), omap_head(0),
+      expected_object_size(0),
+      expected_write_size(0) {}
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& p);
