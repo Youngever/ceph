@@ -205,6 +205,12 @@ TEST_P(StoreTest, SimpleColPreHashTest) {
 TEST_P(StoreTest, SimpleObjectTest) {
   int r;
   coll_t cid;
+  ghobject_t hoid(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  {
+    bufferlist in;
+    r = store->read(cid, hoid, 0, 5, in);
+    ASSERT_EQ(-ENOENT, r);
+  }
   {
     ObjectStore::Transaction t;
     t.create_collection(cid, 0);
@@ -212,7 +218,6 @@ TEST_P(StoreTest, SimpleObjectTest) {
     r = store->apply_transaction(t);
     ASSERT_EQ(r, 0);
   }
-  ghobject_t hoid(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
   {
     bool exists = store->exists(cid, hoid);
     ASSERT_TRUE(!exists);

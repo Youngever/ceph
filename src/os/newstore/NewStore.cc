@@ -1056,7 +1056,7 @@ int NewStore::read(
   bl.clear();
   CollectionRef c = _get_collection(cid);
   if (!c)
-    return false;
+    return -ENOENT;
   RWLock::RLocker l(c->lock);
 
   int r;
