@@ -85,6 +85,34 @@ TEST_P(StoreTest, collect_metadata) {
   }
 }
 
+TEST_P(StoreTest, TrivialRemount) {
+  store->umount();
+  int r = store->mount();
+  ASSERT_EQ(0, r);
+}
+
+TEST_P(StoreTest, SimpleRemount) {
+  coll_t cid;
+  int r;
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    cerr << "create collection" << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+  store->umount();
+  r = store->mount();
+  ASSERT_EQ(0, r);
+  {
+    ObjectStore::Transaction t;
+    t.remove_collection(cid);
+    cerr << "remove collection" << std::endl;
+    r = store->apply_transaction(t);
+    ASSERT_EQ(r, 0);
+  }
+}
+
 TEST_P(StoreTest, SimpleMetaColTest) {
   coll_t cid;
   int r = 0;

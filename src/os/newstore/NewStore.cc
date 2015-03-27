@@ -917,17 +917,17 @@ int NewStore::umount()
 
 void NewStore::sync(Context *onsync)
 {
-
+#warning write sync
 }
 
 void NewStore::sync()
 {
-
+#warning write sync
 }
 
 void NewStore::flush()
 {
-
+#warning write flush
 }
 
 void NewStore::sync_and_flush()

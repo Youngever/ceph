@@ -437,6 +437,7 @@ private:
       kv_cond.Signal();
     }
     kv_sync_thread.join();
+    kv_stop = false;
   }
 
   wal_op_t *_get_wal_op(TransContext *txc);
