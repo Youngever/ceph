@@ -128,8 +128,11 @@ static int decode_escaped(const char *p, string *out)
 // --.7fffffffffffffff.B9FA767A.!0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!fffffffffffffffe.ffffffffffffffff
 
 static void get_coll_key_range(const coll_t& cid, int bits,
+			       string *temp_start, string *temp_end,
 			       string *start, string *end)
 {
+  temp_start->clear();
+  temp_end->clear();
   start->clear();
   end->clear();
 
@@ -146,11 +149,17 @@ static void get_coll_key_range(const coll_t& cid, int bits,
       start->append(buf);
     }
     *end = *start;
+    *temp_start = *start;
+    *temp_end = *start;
 
     snprintf(buf, sizeof(buf), ".%016llx.%08x.",
 	     (unsigned long long)(pgid.pool() + 0x8000000000000000ull),
 	     (unsigned)hobject_t::_reverse_nibbles(pgid.ps()));
     start->append(buf);
+    snprintf(buf, sizeof(buf), ".%016llx.%08x.",
+	     (unsigned long long)((-1ll - pgid.pool()) + 0x8000000000000000ull),
+	     (unsigned)hobject_t::_reverse_nibbles(pgid.ps()));
+    temp_start->append(buf);
 
     uint64_t end_hash = hobject_t::_reverse_nibbles(pgid.ps());
     end_hash += (1ull << (32-bits));
@@ -163,9 +172,12 @@ static void get_coll_key_range(const coll_t& cid, int bits,
 	       (unsigned)end_hash);
     }
     end->append(buf);
+    temp_end->append(buf);
   } else if (cid.is_meta()) {
     *start = "--.7fffffffffffffff.00000000.";
     *end =   "--.7fffffffffffffff.gggggggg.";
+    *temp_start = *start;
+    *temp_end = *end;
   } else {
     assert(0);
   }
@@ -1278,9 +1290,26 @@ int NewStore::collection_list(coll_t cid, vector<ghobject_t>& o)
   RWLock::RLocker l(c->lock);
   int r = 0;
   KeyValueDB::Iterator it = db->get_iterator(PREFIX_OBJ);
+  string temp_start_key, temp_end_key;
   string start_key, end_key;
-  get_coll_key_range(cid, c->cnode.bits, &start_key, &end_key);
-  dout(20) << __func__ << " range " << start_key << " to " << end_key << dendl;
+  get_coll_key_range(cid, c->cnode.bits, &temp_start_key, &temp_end_key,
+		     &start_key, &end_key);
+  dout(20) << __func__ << " range " << temp_start_key << " to " << temp_end_key
+	   << " and " << start_key << " to " << end_key << dendl;
+  it->upper_bound(temp_start_key);
+  while (it->valid()) {
+    if (strcmp(it->key().c_str(), temp_end_key.c_str()) > 0) {
+      dout(20) << __func__ << " key " << it->key() << " > "
+	       << temp_end_key << dendl;
+      break;
+    }
+    dout(20) << __func__ << " key " << it->key() << dendl;
+    ghobject_t oid;
+    int r = get_key_object(it->key(), &oid);
+    assert(r == 0);
+    o.push_back(oid);
+    it->next();
+  }
   it->upper_bound(start_key);
   while (it->valid()) {
     if (strcmp(it->key().c_str(), end_key.c_str()) > 0) {
@@ -1312,23 +1341,38 @@ int NewStore::collection_list_partial(
   RWLock::RLocker l(c->lock);
   int r = 0;
   KeyValueDB::Iterator it;
-  string start_key, start_range_key, end_key;
+  string temp_start_key, temp_end_key;
+  string start_key, end_key;
   bool set_next = false;
+  const char *end;
+  bool temp;
+
   if (start == ghobject_t::get_max())
     goto out;
-  get_coll_key_range(cid, c->cnode.bits, &start_range_key, &end_key);
-  if (start == ghobject_t()) {
-    start_key = start_range_key;
-  } else {
-    get_object_key(start, &start_key);
-    assert(start_key >= start_range_key);
-  }
-  dout(20) << __func__ << " range " << start_range_key << " to " << end_key
+  get_coll_key_range(cid, c->cnode.bits, &temp_start_key, &temp_end_key,
+		     &start_key, &end_key);
+  dout(20) << __func__ << " range " << temp_start_key << " to "
+	   << temp_end_key << " and " << start_key << " to " << end_key
 	   << " start " << start << dendl;
   it = db->get_iterator(PREFIX_OBJ);
-  it->upper_bound(start_key);
+  if (start == ghobject_t()) {
+    it->upper_bound(temp_start_key);
+    temp = true;
+  } else {
+    string k;
+    get_object_key(start, &k);
+    if (start.hobj.is_temp()) {
+      temp = true;
+      assert(k >= temp_start_key && k < temp_end_key);
+    } else {
+      temp = false;
+      assert(k >= start_key && k < end_key);
+    }
+    it->upper_bound(k);
+  }
+  end = temp ? temp_end_key.c_str() : end_key.c_str();
   while (it->valid()) {
-    if (strcmp(it->key().c_str(), end_key.c_str()) > 0) {
+    if (strcmp(it->key().c_str(), end) > 0) {
       dout(20) << __func__ << " key " << it->key() << " > " << end_key << dendl;
       break;
     }
@@ -1343,6 +1387,10 @@ int NewStore::collection_list_partial(
       break;
     }
     it->next();
+    if (temp && !it->valid()) {
+      temp = false;
+      it->upper_bound(start_key);
+    }
   }
   if (!set_next) {
     *pnext = ghobject_t::get_max();
