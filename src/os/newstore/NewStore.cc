@@ -1308,9 +1308,12 @@ int NewStore::collection_list(coll_t cid, vector<ghobject_t>& o)
 	   << " and " << start_key << " to " << end_key << dendl;
   end = temp_start_key.c_str();
   it->upper_bound(temp_start_key);
-  while (it->valid()) {
-    if (strcmp(it->key().c_str(), end) > 0) {
-      dout(20) << __func__ << " key " << it->key() << " > " << end << dendl;
+  while (true) {
+    if (!it->valid() || strcmp(it->key().c_str(), end) > 0) {
+      if (!it->valid())
+	dout(20) << __func__ << " iterator not valid (end of db?)" << dendl;
+      else
+	dout(20) << __func__ << " key " << it->key() << " > " << end << dendl;
       if (temp) {
 	dout(30) << __func__ << " switch to non-temp namespace" << dendl;
 	temp = false;
@@ -1326,11 +1329,6 @@ int NewStore::collection_list(coll_t cid, vector<ghobject_t>& o)
     assert(r == 0);
     o.push_back(oid);
     it->next();
-    if (temp && !it->valid()) {
-      temp = false;
-      it->upper_bound(start_key);
-      end = end_key.c_str();
-    }
   }
   dout(10) << __func__ << " " << cid << " = " << r << dendl;
   return r;
@@ -1380,9 +1378,12 @@ int NewStore::collection_list_partial(
     it->upper_bound(k);
   }
   end = temp ? temp_end_key.c_str() : end_key.c_str();
-  while (it->valid()) {
-    if (strcmp(it->key().c_str(), end) > 0) {
-      dout(20) << __func__ << " key " << it->key() << " > " << end << dendl;
+  while (true) {
+    if (!it->valid() || strcmp(it->key().c_str(), end) > 0) {
+      if (!it->valid())
+	dout(20) << __func__ << " iterator not valid (end of db?)" << dendl;
+      else
+	dout(20) << __func__ << " key " << it->key() << " > " << end << dendl;
       if (temp) {
 	dout(30) << __func__ << " switch to non-temp namespace" << dendl;
 	temp = false;
@@ -1403,11 +1404,6 @@ int NewStore::collection_list_partial(
       break;
     }
     it->next();
-    if (temp && !it->valid()) {
-      temp = false;
-      it->upper_bound(start_key);
-      end = end_key.c_str();
-    }
   }
   if (!set_next) {
     *pnext = ghobject_t::get_max();
