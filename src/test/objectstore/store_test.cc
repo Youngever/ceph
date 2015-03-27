@@ -1375,7 +1375,8 @@ TEST_P(StoreTest, AttrSynthetic) {
 }
 
 TEST_P(StoreTest, HashCollisionTest) {
-  coll_t cid(spg_t(pg_t(0,11),shard_id_t::NO_SHARD));
+  int64_t poolid = 11;
+  coll_t cid(spg_t(pg_t(0,poolid),shard_id_t::NO_SHARD));
   int r;
   {
     ObjectStore::Transaction t;
@@ -1395,7 +1396,7 @@ TEST_P(StoreTest, HashCollisionTest) {
     if (!(i % 5)) {
       cerr << "Object n" << n << " "<< i << std::endl;
     }
-    ghobject_t hoid(hobject_t(string(buf) + base, string(), CEPH_NOSNAP, 0, 0, string(nbuf)));
+    ghobject_t hoid(hobject_t(string(buf) + base, string(), CEPH_NOSNAP, 0, poolid, string(nbuf)));
     {
       ObjectStore::Transaction t;
       t.touch(cid, hoid);

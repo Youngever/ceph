@@ -166,17 +166,25 @@ static void get_coll_key_range(const coll_t& cid, int bits,
     if (end_hash > 0xffffffff) {
       snprintf(buf, sizeof(buf), ".%016llx.gggggggg.",
 	       (unsigned long long)(pgid.pool() + 0x8000000000000000ull));
+      end->append(buf);
+      snprintf(buf, sizeof(buf), ".%016llx.gggggggg.",
+	       (unsigned long long)((-1ll - pgid.pool()) + 0x8000000000000000ull));
+      temp_end->append(buf);
     } else {
       snprintf(buf, sizeof(buf), ".%016llx.%08x.",
 	       (unsigned long long)(pgid.pool() + 0x8000000000000000ull),
 	       (unsigned)end_hash);
+      end->append(buf);
+      snprintf(buf, sizeof(buf), ".%016llx.%08x.",
+	       (unsigned long long)((-1ll - pgid.pool()) + 0x8000000000000000ull),
+	       (unsigned)end_hash);
+      temp_end->append(buf);
     }
-    end->append(buf);
-    temp_end->append(buf);
   } else if (cid.is_meta()) {
     *start = "--.7fffffffffffffff.00000000.";
     *end =   "--.7fffffffffffffff.gggggggg.";
-    *temp_start = *start;
+    // no separate temp section
+    *temp_start = *end;
     *temp_end = *end;
   } else {
     assert(0);
@@ -1292,15 +1300,24 @@ int NewStore::collection_list(coll_t cid, vector<ghobject_t>& o)
   KeyValueDB::Iterator it = db->get_iterator(PREFIX_OBJ);
   string temp_start_key, temp_end_key;
   string start_key, end_key;
+  bool temp = true;
+  const char *end;
   get_coll_key_range(cid, c->cnode.bits, &temp_start_key, &temp_end_key,
 		     &start_key, &end_key);
   dout(20) << __func__ << " range " << temp_start_key << " to " << temp_end_key
 	   << " and " << start_key << " to " << end_key << dendl;
+  end = temp_start_key.c_str();
   it->upper_bound(temp_start_key);
   while (it->valid()) {
-    if (strcmp(it->key().c_str(), temp_end_key.c_str()) > 0) {
-      dout(20) << __func__ << " key " << it->key() << " > "
-	       << temp_end_key << dendl;
+    if (strcmp(it->key().c_str(), end) > 0) {
+      dout(20) << __func__ << " key " << it->key() << " > " << end << dendl;
+      if (temp) {
+	dout(30) << __func__ << " switch to non-temp namespace" << dendl;
+	temp = false;
+	it->upper_bound(start_key);
+	end = end_key.c_str();
+	continue;
+      }
       break;
     }
     dout(20) << __func__ << " key " << it->key() << dendl;
@@ -1309,19 +1326,11 @@ int NewStore::collection_list(coll_t cid, vector<ghobject_t>& o)
     assert(r == 0);
     o.push_back(oid);
     it->next();
-  }
-  it->upper_bound(start_key);
-  while (it->valid()) {
-    if (strcmp(it->key().c_str(), end_key.c_str()) > 0) {
-      dout(20) << __func__ << " key " << it->key() << " > " << end_key << dendl;
-      break;
+    if (temp && !it->valid()) {
+      temp = false;
+      it->upper_bound(start_key);
+      end = end_key.c_str();
     }
-    dout(20) << __func__ << " key " << it->key() << dendl;
-    ghobject_t oid;
-    int r = get_key_object(it->key(), &oid);
-    assert(r == 0);
-    o.push_back(oid);
-    it->next();
   }
   dout(10) << __func__ << " " << cid << " = " << r << dendl;
   return r;
@@ -1373,7 +1382,14 @@ int NewStore::collection_list_partial(
   end = temp ? temp_end_key.c_str() : end_key.c_str();
   while (it->valid()) {
     if (strcmp(it->key().c_str(), end) > 0) {
-      dout(20) << __func__ << " key " << it->key() << " > " << end_key << dendl;
+      dout(20) << __func__ << " key " << it->key() << " > " << end << dendl;
+      if (temp) {
+	dout(30) << __func__ << " switch to non-temp namespace" << dendl;
+	temp = false;
+	it->upper_bound(start_key);
+	end = end_key.c_str();
+	continue;
+      }
       break;
     }
     dout(20) << __func__ << " key " << it->key() << dendl;
@@ -1390,6 +1406,7 @@ int NewStore::collection_list_partial(
     if (temp && !it->valid()) {
       temp = false;
       it->upper_bound(start_key);
+      end = end_key.c_str();
     }
   }
   if (!set_next) {
