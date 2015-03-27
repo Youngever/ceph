@@ -38,7 +38,8 @@ ObjectStore *ObjectStore::create(CephContext *cct,
       cct->check_experimental_feature_enabled("keyvaluestore")) {
     return new KeyValueStore(data);
   }
-  if (type == "newstore") {
+  if (type == "newstore" &&
+      cct->check_experimental_feature_enabled("newstore")) {
     return new NewStore(cct, data);
   }
   return NULL;

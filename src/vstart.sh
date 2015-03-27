@@ -171,6 +171,9 @@ case $1 in
     --memstore )
 	    memstore=1
 	    ;;
+    --newstore )
+	    newstore=1
+	    ;;
     --hitset )
 	    hitset="$hitset $2 $3"
 	    shift
@@ -269,6 +272,10 @@ if [ "$memstore" -eq 1 ]; then
     COSDMEMSTORE='
 	osd objectstore = memstore'
 fi
+if [ "$newstore" -eq 1 ]; then
+    COSDMEMSTORE='
+	osd objectstore = newstore'
+fi
 
 # lockdep everywhere?
 # export CEPH_ARGS="--lockdep 1"
@@ -364,6 +371,7 @@ if [ "$start_mon" -eq 1 ]; then
         rgw frontends = fastcgi, civetweb port=$CEPH_RGW_PORT
         filestore fd cache size = 32
         run dir = $CEPH_OUT_DIR
+        enable experimental unrecoverable data corrupting features = newstore
 EOF
 if [ "$cephx" -eq 1 ] ; then
 cat <<EOF >> $conf_fn
