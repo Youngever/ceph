@@ -1457,7 +1457,8 @@ TEST_P(StoreTest, HashCollisionTest) {
 }
 
 TEST_P(StoreTest, ScrubTest) {
-  coll_t cid(spg_t(pg_t(0, 111),shard_id_t(1)));
+  int64_t poolid = 111;
+  coll_t cid(spg_t(pg_t(0, poolid),shard_id_t(1)));
   int r;
   {
     ObjectStore::Transaction t;
@@ -1473,7 +1474,8 @@ TEST_P(StoreTest, ScrubTest) {
     if (!(i % 5)) {
       cerr << "Object " << i << std::endl;
     }
-    ghobject_t hoid(hobject_t(string(buf) + base, string(), CEPH_NOSNAP, i, 0, ""),
+    ghobject_t hoid(hobject_t(string(buf) + base, string(), CEPH_NOSNAP, i,
+			      poolid, ""),
 		    ghobject_t::NO_GEN, shard_id_t(1));
     {
       ObjectStore::Transaction t;
@@ -1486,10 +1488,10 @@ TEST_P(StoreTest, ScrubTest) {
 
   // Add same hobject_t but different generation
   {
-    ghobject_t hoid1(hobject_t("same-object", string(), CEPH_NOSNAP, 0, 0, ""),
+    ghobject_t hoid1(hobject_t("same-object", string(), CEPH_NOSNAP, 0, poolid, ""),
 		     ghobject_t::NO_GEN, shard_id_t(1));
-    ghobject_t hoid2(hobject_t("same-object", string(), CEPH_NOSNAP, 0, 0, ""), (gen_t)1, shard_id_t(1));
-    ghobject_t hoid3(hobject_t("same-object", string(), CEPH_NOSNAP, 0, 0, ""), (gen_t)2, shard_id_t(1));
+    ghobject_t hoid2(hobject_t("same-object", string(), CEPH_NOSNAP, 0, poolid, ""), (gen_t)1, shard_id_t(1));
+    ghobject_t hoid3(hobject_t("same-object", string(), CEPH_NOSNAP, 0, poolid, ""), (gen_t)2, shard_id_t(1));
     ObjectStore::Transaction t;
     t.touch(cid, hoid1);
     t.touch(cid, hoid2);
