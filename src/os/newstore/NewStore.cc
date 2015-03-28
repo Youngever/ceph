@@ -706,12 +706,23 @@ int NewStore::_lock_fsid()
 
 bool NewStore::test_mount_in_use()
 {
-  int r = _open_fsid(false);
+  // most error conditions mean the mount is not in use (e.g., because
+  // it doesn't exist).  only if we fail to lock do we conclude it is
+  // in use.
+  bool ret = false;
+  int r = _open_path();
   if (r < 0)
-    return true;
+    return false;
+  r = _open_fsid(false);
+  if (r < 0)
+    goto out_path;
   r = _lock_fsid();
+  if (r < 0)
+    ret = true; // if we can't lock, it is in used
   _close_fsid();
-  return (r < 0);
+ out_path:
+  _close_path();
+  return ret;
 }
 
 int NewStore::_open_db()
@@ -748,7 +759,8 @@ void NewStore::_close_db()
 
 int NewStore::_open_collections()
 {
-  for (KeyValueDB::Iterator it = db->get_iterator(PREFIX_COLL);
+  KeyValueDB::Iterator it = db->get_iterator(PREFIX_COLL);
+  for (it->upper_bound(string());
        it->valid();
        it->next()) {
     coll_t cid;
@@ -760,6 +772,8 @@ int NewStore::_open_collections()
       ::decode(c->cnode, p);
       dout(20) << __func__ << " opened " << cid << dendl;
       coll_map[cid] = c;
+    } else {
+      dout(20) << __func__ << " unrecognized collection " << it->key() << dendl;
     }
   }
   return 0;
