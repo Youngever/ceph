@@ -142,7 +142,7 @@
 #define tracepoint(...)
 #endif
 
-static coll_t META_COLL;
+#define META_COLL coll_t()
 
 #define dout_subsys ceph_subsys_osd
 #undef dout_prefix

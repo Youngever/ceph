@@ -29,7 +29,7 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "ceph_test_objectstore_state "
 
-const coll_t TestObjectStoreState::META_COLL;
+#define META_COLL coll_t()
 
 void TestObjectStoreState::init(int colls, int objs)
 {
