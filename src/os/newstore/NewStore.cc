@@ -1081,6 +1081,9 @@ int NewStore::read(
     goto out;
   }
 
+  if (offset == length && offset == 0)
+    length = o->onode.size;
+
   r = _do_read(o, offset, length, bl, op_flags);
 
  out:
