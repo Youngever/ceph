@@ -2243,7 +2243,7 @@ int main(int argc, char **argv) {
   g_ceph_context->_conf->set_val("filestore_fiemap", "true");
   g_ceph_context->_conf->set_val(
     "enable_experimental_unrecoverable_data_corrupting_features",
-    "keyvaluestore, newstore");
+    "keyvaluestore, newstore, rocksdb");
   g_ceph_context->_conf->apply_changes(NULL);
 
   ::testing::InitGoogleTest(&argc, argv);
